@@ -13,6 +13,9 @@ pub enum Core {
     Lam { params: Vec<Param>, ret: Type, body: Box<Core>, pure: bool, span: Span },
     App { f: Box<Core>, args: Vec<Core>, span: Span },
     Let { name: Rc<str>, rhs: Box<Core>, body: Box<Core>, span: Span },
+    /// design/interp-capability.md §2.1: letrec。束縛対象は Lam のみ（check で検査）。
+    /// body は末尾位置（§8.5 の Let.body と同じ扱い。SPEC 側の追記は別途報告のみ）。
+    Letrec { name: Rc<str>, lam: Box<Core>, body: Box<Core>, span: Span },
     If { cond: Box<Core>, then: Box<Core>, else_: Box<Core>, span: Span },
     Match { scrutinee: Box<Core>, arms: Vec<MatchArm>, span: Span },
     Obj { fields: Vec<(Rc<str>, Core)>, span: Span },
@@ -30,6 +33,7 @@ impl Core {
             | Core::Lam { span, .. }
             | Core::App { span, .. }
             | Core::Let { span, .. }
+            | Core::Letrec { span, .. }
             | Core::If { span, .. }
             | Core::Match { span, .. }
             | Core::Obj { span, .. }

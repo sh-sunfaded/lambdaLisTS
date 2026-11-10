@@ -9,11 +9,17 @@ pub enum Type {
     Dec,
     Str,
     Bool,
+    Char,                           // Unicode スカラー値1つ（design/interp-capability.md §1.2）
     Nil,
     Literal(Rc<str>),
     Array(Box<Type>),
     Union(Vec<Type>),
     Obj(BTreeMap<Rc<str>, Type>),
+    Map(Box<Type>, Box<Type>),      // (map K V) — design/interp-capability.md §1.1
+    Set(Box<Type>),                 // (set K)
+    Ref(Box<Type>),                 // (ref T) — §1.5（エフェクト型のセル）
+    Builder,                        // builder プリミティブ — §3.2
+    Bytes,                          // bytes プリミティブ（不変バイト列）— §1.4
     ResultT(Box<Type>, Box<Type>),
     FnT(Vec<Type>, Box<Type>),
     Var(usize),
@@ -37,11 +43,19 @@ pub fn structural_equal(a: &Type, b: &Type) -> bool {
         | (Type::Dec, Type::Dec)
         | (Type::Str, Type::Str)
         | (Type::Bool, Type::Bool)
+        | (Type::Char, Type::Char)
         | (Type::Nil, Type::Nil) => true,
         (Type::Literal(x), Type::Literal(y)) => x == y,
         (Type::Var(x), Type::Var(y)) => x == y,
         (Type::Alias(x), Type::Alias(y)) => x == y,
         (Type::Array(x), Type::Array(y)) => structural_equal(x, y),
+        (Type::Map(xk, xv), Type::Map(yk, yv)) => {
+            structural_equal(xk, yk) && structural_equal(xv, yv)
+        }
+        (Type::Set(x), Type::Set(y)) => structural_equal(x, y),
+        (Type::Ref(x), Type::Ref(y)) => structural_equal(x, y),
+        (Type::Builder, Type::Builder) => true,
+        (Type::Bytes, Type::Bytes) => true,
         (Type::Union(xs), Type::Union(ys)) => {
             if xs.len() != ys.len() {
                 return false;
@@ -125,6 +139,13 @@ fn normalize_type_seen(t: &Type, aliases: &AliasEnv, seen: &mut BTreeSet<Rc<str>
             Type::Union(normalize_union(flat, aliases))
         }
         Type::Array(el) => Type::Array(Box::new(normalize_type_seen(el, aliases, seen))),
+        Type::Map(k, v) => Type::Map(
+            Box::new(normalize_type_seen(k, aliases, seen)),
+            Box::new(normalize_type_seen(v, aliases, seen)),
+        ),
+        Type::Set(k) => Type::Set(Box::new(normalize_type_seen(k, aliases, seen))),
+        Type::Ref(inner) => Type::Ref(Box::new(normalize_type_seen(inner, aliases, seen))),
+        Type::Builder => Type::Builder,
         Type::Obj(fields) => Type::Obj(
             fields
                 .iter()
@@ -150,6 +171,9 @@ pub fn find_unresolved_alias(t: &Type) -> Option<Rc<str>> {
     match t {
         Type::Alias(name) => Some(name.clone()),
         Type::Array(el) => find_unresolved_alias(el),
+        Type::Map(k, v) => find_unresolved_alias(k).or_else(|| find_unresolved_alias(v)),
+        Type::Set(k) => find_unresolved_alias(k),
+        Type::Ref(inner) => find_unresolved_alias(inner),
         Type::Union(members) => members.iter().find_map(find_unresolved_alias),
         Type::Obj(fields) => fields.values().find_map(find_unresolved_alias),
         Type::ResultT(ok, err) => find_unresolved_alias(ok).or_else(|| find_unresolved_alias(err)),
@@ -176,6 +200,7 @@ fn print_type_seen(t: &Type, aliases: &AliasEnv, seen: &mut BTreeSet<Rc<str>>) -
         Type::Dec => "decimal".to_string(),
         Type::Str => "string".to_string(),
         Type::Bool => "bool".to_string(),
+        Type::Char => "char".to_string(),
         Type::Nil => "nil".to_string(),
         Type::Literal(v) => serde_json::to_string(v.as_ref()).unwrap_or_else(|_| format!("\"{v}\"")),
         Type::Var(id) => format!("?{id}"),
@@ -189,6 +214,15 @@ fn print_type_seen(t: &Type, aliases: &AliasEnv, seen: &mut BTreeSet<Rc<str>>) -
             _ => name.to_string(),
         },
         Type::Array(el) => format!("(Array {})", print_type_seen(el, aliases, seen)),
+        Type::Map(k, v) => format!(
+            "(map {} {})",
+            print_type_seen(k, aliases, seen),
+            print_type_seen(v, aliases, seen)
+        ),
+        Type::Set(k) => format!("(set {})", print_type_seen(k, aliases, seen)),
+        Type::Ref(inner) => format!("(ref {})", print_type_seen(inner, aliases, seen)),
+        Type::Builder => "builder".to_string(),
+        Type::Bytes => "bytes".to_string(),
         Type::Union(members) => {
             let members = normalize_union(members.clone(), aliases);
             let non_nil: Vec<&Type> = members.iter().filter(|m| !matches!(m, Type::Nil)).collect();
@@ -244,6 +278,12 @@ mod tests {
     fn arr(el: Type) -> Type {
         Type::Array(Box::new(el))
     }
+    fn map_t(k: Type, v: Type) -> Type {
+        Type::Map(Box::new(k), Box::new(v))
+    }
+    fn set_t(k: Type) -> Type {
+        Type::Set(Box::new(k))
+    }
     fn union(ms: Vec<Type>) -> Type {
         Type::Union(ms)
     }
@@ -270,6 +310,9 @@ mod tests {
     #[test]
     fn print_type_canonical_forms() {
         assert_eq!(print_type_plain(&Type::Number), "number");
+        assert_eq!(print_type_plain(&Type::Char), "char");
+        assert!(structural_equal(&Type::Char, &Type::Char));
+        assert!(!structural_equal(&Type::Char, &Type::Str));
         assert_eq!(print_type_plain(&lit("EmptyCart")), "\"EmptyCart\"");
         assert_eq!(print_type_plain(&arr(Type::Number)), "(Array number)");
         assert_eq!(
@@ -294,6 +337,31 @@ mod tests {
         );
         assert_eq!(print_type_plain(&fn_t(vec![], Type::Number)), "(fn () : number)");
         assert_eq!(print_type_plain(&Type::Var(7)), "?7");
+        assert_eq!(
+            print_type_plain(&map_t(Type::Str, Type::Number)),
+            "(map string number)"
+        );
+        assert_eq!(print_type_plain(&set_t(Type::Number)), "(set number)");
+    }
+
+    #[test]
+    fn map_set_structural_equal_and_union_sort() {
+        let e = AliasEnv::new();
+        assert!(structural_equal(
+            &map_t(Type::Str, Type::Number),
+            &map_t(Type::Str, Type::Number)
+        ));
+        assert!(!structural_equal(
+            &map_t(Type::Str, Type::Number),
+            &map_t(Type::Number, Type::Number)
+        ));
+        assert!(!structural_equal(&set_t(Type::Str), &map_t(Type::Str, Type::Nil)));
+        let ms = normalize_union(
+            vec![map_t(Type::Str, Type::Number), Type::Str, set_t(Type::Str)],
+            &e,
+        );
+        let printed: Vec<String> = ms.iter().map(print_type_plain).collect();
+        assert_eq!(printed, ["(map string number)", "(set string)", "string"]);
     }
 
     #[test]

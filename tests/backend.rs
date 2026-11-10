@@ -45,6 +45,8 @@ fn emit_fixture(base: &str) -> Result<EmitOutput, Vec<Diagnostic>> {
         source_file: format!("{base}.lts"),
         type_names,
         impure_names: BTreeSet::new(),
+        seed: lists::rng::DEFAULT_SEED,
+        aliases: Default::default(),
     })
 }
 
@@ -58,6 +60,8 @@ fn emit_src(src: &str, file: &str) -> Result<EmitOutput, Vec<Diagnostic>> {
         source_file: "test.lts".to_string(),
         type_names: BTreeSet::new(),
         impure_names: BTreeSet::new(),
+        seed: lists::rng::DEFAULT_SEED,
+        aliases: Default::default(),
     })
 }
 
@@ -65,6 +69,9 @@ fn write_out(dir: &Path, name: &str, out: &EmitOutput) {
     std::fs::write(dir.join(format!("{name}.js")), &out.js).expect("write js");
     std::fs::write(dir.join(format!("{name}.js.map")), &out.map).expect("write map");
     std::fs::write(dir.join("runtime.js"), RUNTIME_JS).expect("write runtime");
+    if out.uses_prop {
+        std::fs::write(dir.join("prop-runtime.js"), lists::runtime::PROP_RUNTIME_JS).expect("write prop-runtime");
+    }
 }
 
 fn run_node(dir: &Path, args: &[&str]) -> Output {
@@ -262,7 +269,7 @@ fn tail_call_codegen_behaves_via_backend() {
             path: PathBuf::from(fixture_path(&format!("{fixture}.lts"))),
             name: format!("{fixture}.lts"),
         }];
-        let artifacts = backend.compile(&sources, &dir).expect("compile");
+        let artifacts = backend.compile(&sources, &dir, lists::rng::DEFAULT_SEED).expect("compile");
         let driver = match fixture {
             "tail-self" => "import { count_down } from \"./tail-self.js\";\nconsole.log(\"count_down(1000000) = \" + count_down(1000000, 0));\n",
             _ => "import { is_even } from \"./tail-mutual.js\";\nconsole.log(\"is_even(1000000) = \" + is_even(1000000));\n",

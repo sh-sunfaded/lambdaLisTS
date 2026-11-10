@@ -88,6 +88,7 @@ fn lit_value(v: &LitValue) -> Value {
         LitValue::Dec(text) => Value::Dec(crate::decimal::parse_dec_scientific(text).unwrap_or(0)),
         LitValue::Str(s) => Value::Str(s.clone()),
         LitValue::Bool(b) => Value::Bool(*b),
+        LitValue::Char(c) => Value::Char(*c),
         LitValue::Nil => Value::Nil,
     }
 }
@@ -267,6 +268,9 @@ impl Desugarer {
                 Prim::Dec => Type::Dec,
                 Prim::Str => Type::Str,
                 Prim::Bool => Type::Bool,
+                Prim::Char => Type::Char,
+                Prim::Builder => Type::Builder,
+                Prim::Bytes => Type::Bytes,
                 Prim::Nil => Type::Nil,
             },
             TypeExpr::Alias { name, .. } => Type::Alias(name.clone()),
@@ -302,6 +306,14 @@ impl Desugarer {
                     }
                 }
                 Type::Obj(map)
+            }
+            TypeExpr::Map { key, value, .. } => Type::Map(
+                Box::new(self.type_(key, &ast_path(path, &["key"]))),
+                Box::new(self.type_(value, &ast_path(path, &["value"]))),
+            ),
+            TypeExpr::Set { key, .. } => Type::Set(Box::new(self.type_(key, &ast_path(path, &["key"])))),
+            TypeExpr::Ref { inner, .. } => {
+                Type::Ref(Box::new(self.type_(inner, &ast_path(path, &["inner"]))))
             }
             TypeExpr::ResultT { ok, err, .. } => Type::ResultT(
                 Box::new(self.type_(ok, &ast_path(path, &["ok"]))),
@@ -415,6 +427,33 @@ impl Desugarer {
                     };
                 }
                 acc
+            }
+            Expr::Letrec {
+                name,
+                lam,
+                body,
+                span,
+                ..
+            } => {
+                // body... は最後の式が値。それ以前は let _ の連鎖として脱糖する。
+                let mut acc = self.expr(
+                    body.last().expect("letrec body non-empty"),
+                    &ast_path(path, &["body", &(body.len() - 1).to_string()]),
+                );
+                for (i, e) in body.iter().enumerate().rev().skip(1) {
+                    acc = Core::Let {
+                        name: Rc::from("_"),
+                        rhs: Box::new(self.expr(e, &ast_path(path, &["body", &i.to_string()]))),
+                        body: Box::new(acc),
+                        span: span.clone(),
+                    };
+                }
+                Core::Letrec {
+                    name: name.clone(),
+                    lam: Box::new(self.expr(lam, &ast_path(path, &["lam"]))),
+                    body: Box::new(acc),
+                    span: span.clone(),
+                }
             }
             Expr::If {
                 cond,

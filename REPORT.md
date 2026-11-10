@@ -323,3 +323,217 @@ SPEC には「decimal は P1」（§8.6/§11/§14）としかないため、本�
 - **テスト（追記のみ）**: `tests/tools.rs::repl_host_log_matches_documented_shape_and_is_deterministic` を新規追加。`--host mock` で `log! "5"` と `tick! 5` を実行して host-log を2回要求し、応答が文書化した形式と一致すること（calls は effect/args、args は全要素が文字列。数値 5 と文字列 "5" はともに "5" と記録されることを観測）、2回目の host-log も同一内容（呼び出し順の蓄積）、同一入力の2回実行で stdout が一致（決定性 MUST）を検査。ゴールデン `tests/golden/repl.host-log.responses.json` を新規追加（UPDATE_SNAPSHOTS=1 で生成）。既存テスト・実装（`src/repl.rs` の `host_log`）は無変更。
 - **検証**: `cargo test` 239全パス（+1）、warning 0、`bash scripts/lists-smoke.sh` 24/24。`lists-p1-smoke.sh` はリポジトリ外の独立スクリプトのため本環境では実行不可（検査5該当の host-log 文書化と v0.3 版上げは本変更で解消）。
 - **残課題**: README.md / GUIDE.md 内の「SPEC v0.2」表記は本マイルストーンでは据え置き（SPEC のみ版上げ）。別途更新する。
+
+---
+
+## 18. interp-capability §1.1（C1 map/set）の実装判断（design/interp-capability.md 採用時。SPEC.md は未変更）
+
+対象: design/interp-capability.md §1.1（`(map K V)` / `(set K)`、stdlib 11 関数 + `obj->map`）。条文は SPEC §3.3（型構文）§6（型システム）§8.2/§8.3（値・等価）§9.3（fix）§11（標準ライブラリ）§12.4/§12.5（JS lowering/runtime）に写像して実装。
+
+### 実装
+- **型**: `Type::Map(K,V)` / `Type::Set(K)` を追加。 surface 構文は design 通り小文字 `(map K V)` / `(set K)`（parser/desugar/fmt/names に対応）。print は `(map K V)` / `(set K)`。union 正規化（§6.2 の正規表現バイト列ソート）は print 経由で自動対応、unify は K・V をそれぞれ unify（§6.4）。obj との部分型関係は持たせない（別 discriminant → unify 失敗。obj との相互変換は `obj->map` のみ単方向）。
+- **キー制約**: design は `str/sym/int` だが現 SPEC には sym/int 型が存在しないため **string（リテラル含む）/ number のみ許可**（ギャップは下記参照）。違反は defn/lam/alias/effect/prop の型注釈すべてで type-mismatch + fix テンプレート（型中の map/set キーをすべて string に置換したもの。例: `(map bool number)` → `(map string number)`）（§9.3: type-mismatch には fix MUST）。実行時も map/set キーは str/num 以外を runtime error。
+- **値（interp）**: `Value::Map(Rc<PersistentMap>)` / `Value::Set(Rc<PersistentMap>)`。`src/pmap.rs` の自前永続 AVL 木（キーで平衡、挿入順は各ノードの seq で保持）。更新は path-copying で新しい木を返し既存の共有構造を壊さない（design §1.1「永続構造」）。O(log n) 更新・検索。number キーは JS Map の SameValueZero と一致させるため正規化（-0→+0、NaN→正規ビット）。
+- **等価（§8.3）**: map はキー集合と各値の再帰的等価で決定、**挿入順は無視**。set はキー集合のみ。map と set は別の値種（`=` では不一致、型検査でも unify されない）。循環は構築不可能（不変値のみ）だが既存の path-based 検出も map/set に適用。
+- **stdlib**（純粋関数として scheme 登録）: map-empty / map-get / map-set / map-del / map-keys / map-has? / map-size / set-empty / set-add / set-has? / set->array。map-keys / set->array は挿入順で返す（決定性）。map-get の失敗は `(err (obj (tag "not-found")))`、型は `(Result V (obj (tag "not-found")))`（design の `(result V not-found)` を現 SPEC の Result + obj tag 方式へ写像）。
+- **obj->map**: 単方向のみ。obj（固定キー構造体型）は存続。戻り値型は obj フィールド値型の union を値型とする `(map string (union ...))` で、check.rs の App 直下の特殊処理で組み立てる（rank-1 多相では「フィールド値の union」を直接表現できないため）。高階位置に渡した場合の fallback scheme は `(fn (T) : (map string U))`（値型 U は文脈で unify）。実行時は obj の BTreeMap キー順（UTF-8 バイト順）= ソート順で挿入。
+- **JS バックエンド（§12.4/§12.5）**: map は内部 `Map`（design §7 の写像表通り）。**set は内部 `Set`**（design §7 の「set も Map」からの逸脱: map と set を `=` で区別するために Set が必要。型検査上は比較し得ないが値レベルで区別を維持）。挿入順反復は JS Map/Set の挿入順で interp と一致（上書きは元の順序を維持 = seq に相当）。構造的等価は runtime.js の structuralEqual に Map/Set 分岐を追加（deep-equal、順序無視、WeakMap で循環検出）。obj->map はキーを codepoint 順にソートしてから Map に入れる（Rust の BTreeMap と一致）。
+- **印字（§11.6 は map/set を未定義のため新規決定）**: 挿入順の s 式 `(map (k v) ...)` / `(set k ...)`、空は `(map)` / `(set)`。interp `print_value` と JS `$print_m` で同一形式。
+- **JSON（example 出力・機械可読性）**: `{"tag":"Map","entries":[[k,v],...]}` / `{"tag":"Set","items":[...]}`（挿入順）。JS 側は map 系使用時のみ `$mjson` を出力（既存の DEC_JS/PRINT_JS は無改変）、Rust 側は `backends.rs::value_to_json`、テストの `json_to_value` にも対応。
+- **lexer**: 名前中の `->`（`obj->map`、`set->array` 等）を単一シンボルとして許可するよう scan_name を拡張。単独の `->` は従来通りパイプ（`is_symbol_start('-')==false` なので不変）。`js_name` は `->` → `_to_`（§12.3 拡張）。
+- **既存出力への影響**: map/set 系 stdlib を使わないプログラムのコンパイル出力はバイト不変（golden テストで検証）。map 使用時のみ `$mjson`/`$print_m`/`$obj_to_map` を追加出力し、2 回コンパイルでバイト一致を確認。
+
+### テスト追加
+- `tests/fixtures/map-edge.lts`（41 example: 基本操作・挿入順・上書き順序維持・map-del・number キー/-0・set・構造的等価（順序無視）・永続性・obj->map・印字・2000 要素の末尾再帰 fold（§8.5）＋ `diff::map_edge_diff_interp_vs_backend`（interp vs compile+node で全 example 一致）
+- `acceptance::map_set_key_type_violation_is_type_mismatch_with_fix`（キー型違反の type-mismatch + fix テンプレート、string/number/alias キーの許可）
+- `acceptance::obj_to_map_infers_union_value_type`（obj->map の union 値型・非 obj への適用は type-mismatch）
+- 単体: pmap.rs（AVL 永続性・挿入順・-0/NaN 正規化・serde 往復）、types.rs（print/normalize/structural_equal）、unify.rs（map/set unify と occurs）、value.rs（map/set 等価・印字）、lexer.rs（`->` in name）、emit.rs（js_name）、fmt.rs（map/set 型の冪等・AST 保存。map-edge.lts を fixture 一覧に追加）
+
+### 検証
+- `cargo test` 254 全パス（既存 239 から +15、壊れなし）。warning 0。
+- `lists compile map-edge.lts` を 2 回実行し出力ディレクトリがバイト一致（決定的）。node で 41/41 example ok。
+- `lists fmt` in-place を 2 回適用しても安定（冪等）。golden（cart.js 等）は無改変でパス。
+- `LISTS_BACKEND=mock` でも acceptance パス（t11 は既存 fixture のみ）。
+
+### ギャップ・残課題（SPEC には報告のみ。独断で直していない）
+1. design §1.1 のキー型 `str/sym/int`: 現 SPEC（v0.3）には `sym` も `int`（i64）も存在しない（i64 は §14 P5）。実装では string/number のみ許可し、sym/int は将来の P5/C2/C4 で吸収する方針。
+2. design の `int` 戻り値（map-size 等）は現 SPEC では `number` のみのため `number` で実装。
+3. design の `(result V not-found)` は現 SPEC の構文 `(Result V (obj (tag "not-found")))` に写像。判断 kind 名は tag リテラルとして表現。
+4. design §7 の写像表「set は内部 Map」からは逸脱し JS では `Set` を使用（map/set の `=` 区別のため）。意味論は design 通り（挿入順・deep-equal）。
+5. SPEC §3.3 の型コンストラクタ命名規則（Array/Result/Option は大文字、union/obj/fn は小文字）と design §1.1 の小文字 `map`/`set` の混在は、SPEC 側の統一が未決定のため design に従った。SPEC 改訂時に統一を検討。
+6. SPEC §11.6 の印字規約は map/set を未定義のため、挿入順 s 式で新規決定（上記）。SPEC 改訂時に追記候補。
+7. unify 後（型変数が具体化された後）の map/set キー制約の再検証は未実施。現状は注釈時の検証＋実行時エラーで担保。
+
+---
+
+## 19. interp-capability §1.2/§3.1（C2 char + 文字列プリミティブ）の実装判断（SPEC.md は未変更）
+
+対象: design/interp-capability.md §1.2（char 型・`\<文字>` リテラル・char-code）と §3.1（位置ベース文字列 API）。条文は SPEC §2（字句）§3.3（型構文）§3.6（パターン）§6（型）§8.3（等価）§11.6（印字）§12.4/§12.5（JS）に写像。
+
+### 実装
+- **型/値**: `Type::Char` / `Value::Char(char)`。surface 型は `char` プリム。サロゲートは存在しない（`char::from_u32` が拒否。lexer の `\uD800` 等もエラー）。
+- **リテラル**: `\<文字>` を lexer に追加。エスケープ規則は str リテラルと共通（`\" \\ \n \t \r \uXXXX`、いずれも単一スカラー値へ）。fmt は `print_char_lit` で逆写像（制御文字は `\uXXXX`）し冪等・AST 保存を確認。
+- **lexer の名前規則拡張**: 名前中の `->`（既存）に加え、演算子接尾辞 `<=? >=? =? <? >?` をシンボルの一部として許可（§3.1 の `char<=?` / `char=?` のため）。単独の `<` `>` `=` `->` は従来通り Punct（演算子・パイプ）のまま。`js_name` はこれらを `_le_`/`_ge_`/`_lt_`/`_gt_`/`_eq_`/`_to_` へ無害化（既存名には影響なし）。
+- **stdlib**（§3.1 を現 SPEC 型へ写像。`str`→string、`int`→number（i64 は P5）、`result`→`(Result T (obj (tag ...)))`）:
+  - `char-at : (fn (string number) : (Result char (obj (tag "out-of-range"))))` — 添字はスカラー値単位・小数は切り捨て（nth と同じ §11.6）、NaN/負/範囲外は err out-of-range
+  - `char-code : (fn (char) : number)`（スカラー値）、`code->char : (fn (number) : (Result char (obj (tag "invalid-code"))))` — 非整数・範囲外・サロゲートは err invalid-code
+  - `str-take-while : (fn (string number (fn (char) : bool)) : (obj (acc : string) (pos : number)))` — 開始位置は slice_bounds と同じクランプ（NaN→0・負は len+x・超過は len）
+  - `str-skip-while : (fn (string number (fn (char) : bool)) : number)` — 位置のみ返す（部分文字列を作らない設計）
+  - `str-split-at : (fn (string number) : (Result (obj (left : string) (right : string)) (obj (tag "out-of-range"))))` — 0..len の範囲のみ ok、NaN/負/超過は err
+  - `str-contains? : (fn (string string) : bool)`（contains? と同じ）
+  - `char<=? char=? : (fn (char char) : bool)`、`char-alphabetic? char-numeric? char-whitespace? : (fn (char) : bool)`
+- **述語の意味論（interp/JS 一致）**: alphabetic = Unicode `Alphabetic`（Rust `char::is_alphabetic` = JS `/\p{Alphabetic}/u`）、numeric = カテゴリ N（`is_numeric` = `/\p{N}/u`）、whitespace = `White_Space`（`is_whitespace` = `/\p{White_Space}/u`）。`char<=?` はコードポイント（スカラー値）比較（JS の文字列 `<=` は UTF-16 コード単位順なので `codePointAt` で比較。U+1F600 vs U+FFFF で差が出ることをテストで確認）。
+- **等価・パターン**: `(= \a \a)` は構造的等価（Char 同士のみ。char と string は unify されない）。match の char リテラルパターンを追加（網羅性検査は char 型全体を1ケースとして扱うため `_` が必要。既存の number リテラルと同じくリテラル1つでは型全体をカバーしない）
+- **印字（§11.6）**: char は string と同じく**生文字**（引用符・エスケープなし）で印字。リテラル構文のみ `\<文字>`。JS 側で char = 1要素文字列なので `$print` でも同一バイト列になる（`str \a` → `"a"`）。
+- **JS バックエンド（§7）**: char は1要素文字列（コードポイント単位）。`char-at` は `[...s][k]`、`char-code` は `codePointAt(0)`、`code->char` は `String.fromCodePoint`＋範囲検査。リテラルは通常の JS 文字列リテラルへ lowering。
+- **JSON**: char は素の JSON 文字列として直列化（JS 側と同一。char と string は JSON 上区別されないため、example の actual に生の char を出さない方針で fixture を設計）。
+
+### テスト追加
+- `tests/fixtures/char-edge.lts`（63 example: リテラル/述語/スカラー値境界（U+1F600・U+FFFF）・code->char の invalid-code 往復（サロゲート 55296/57343・U+110000・負・小数・NaN）・char-at の out-of-range ・位置ベース API の簡単なレキサー（空白スキップ+数字列読み取り。絵文字またぎ）str-split-at・str-contains?・char を含む union と match・印字）→ `diff::char_edge_diff_interp_vs_backend`（interp vs compile+node で全一致）
+- 単体: lexer（char リテラル・サロゲート拒否・演算子接尾辞名）、fmt（char リテラル往復・冪等・AST 保存。char-edge.lts を fixture 一覧へ）、types/unify（char）、js_name
+
+### 検証
+- `cargo test` 257 全パス（254 + 3）、warning 0。`LISTS_BACKEND=mock` でも acceptance 18/18。
+- `lists compile char-edge.lts` を2回実行しバイト一致、node で 63/63 example ok。`lists fmt` in-place 2回で安定。golden 無改変。`git diff -- SPEC.md` 空。
+
+### ギャップ・残課題（SPEC には報告のみ）
+1. design の `int`（char-code の戻り値など）は現 SPEC では `number` のみ（i64 は §14 P5）のため number で実装。char-code の値は 0..0x10FFFF なので f64 で正確に表現できる。
+2. design の `(result char out-of-range)` は `(Result char (obj (tag "out-of-range")))` に写像（map-get の not-found と同じ方式）。
+3. char の印字は §11.6 に未定義のため「string と同じく生文字」と決定（JS の 1要素文字列表現と一致させるため）。`\<文字>` はリテラル構文のみ。SPEC 改訂時に追記候補。
+4. char-at の小数添字は切り捨て（nth と同じ §11.6 规則）。str-split-at は範囲外を err とする（slice_bounds のクランプとは異なる。位置ベース API は「失敗を result で返す」設計のため）。開始位置のクランプのみ slice_bounds と共通。
+5. code->char は非整数を invalid-code とする（往復 code->char(char-code c)=ok c を優先）。trunc 方針もあり得たが記録のみ。
+6. JS で char（1要素文字列）と string は実行時同一なので、`=` は型検査でのみ区別（char vs string は unify 失敗）。JSON 直列化でも区別されない（上記）。
+7. 網羅性検査: char/number のリテラルパターン1つでは型全体をカバーしない（既存の P0 単純アルゴリズム §6.5 のまま）。char リテラルも同様。
+
+---
+
+## 20. interp-capability §3.2（builder）/ §2.1（letrec）/ §1.5（ref）の実装判断（SPEC.md は未変更）
+
+### builder（§3.2 C3）
+- `Type::Builder` / `Value::Builder(Rc<Vec<String>>)`。stdlib: builder-empty / builder-push / builder->str / builder-join（`(fn ((Array string) string) : string)`。design の `str` は string へ写像）。
+- 不変値: push は新しい builder を返す。実装は `Rc::make_mut` で「共有されていないときは in-place、共有時のみ複製」とし、線形利用では償却 O(1)（10^4 要素の畳み込みテストで確認）。JS 側は配列 `[...b, s]` + join（design §7 通り）。
+- 印字: JS 側が配列なので Rust も配列と同じ `[a b c]` 形式で統一（§11.6 に builder は未定義のための新規決定。REPORT 記録）。等価は要素列の構造等価。
+- JSON: 配列として直列化（JS と同一。example の actual に生の builder は出さない方針）。
+
+### letrec（§2.1 C5）
+- 構文 `(letrec [name lam-expr] body...)`（parser/ast/desugar/fmt/names）。body が複数ある場合は let _ の連鎖に脱糖し最後の式が値。
+- Core IR に `Core::Letrec { name, lam, body }` を追加。束縛対象が Lam でない場合は check で type-mismatch + fix（`(fn () : nil <expr>)` で包むテンプレート、§9.3）。
+- 型付け: Lam は注釈から関数型が分かるので、lam 本体の検査前に束縛名へその型を入れてから検査（自己参照が fn 型で検査できる）。
+- 評価: 自己参照環境を作り named closure を束縛。JS 生成は名前付き関数式 `const f = function f(...) {...}`（design §2.1 の直接写像）。letrec 内の自己末尾呼び出しは defn のような self-loop 最適化は行わず通常の再帰（深い letrec 再帰は JS でスタック制限あり。残課題として記録）。
+- **§8.5 との相互作用（ギャップ報告）**: SPEC §8.5 の末尾位置リストに Letrec は未記載。Letrec.body を Let.body と同じく末尾位置として実装（collect_tail_callees で in_tail 伝播）。SPEC への追記は行わず報告のみ。
+- 相互再帰（2つ以上の letrec 束縛の相互参照）は design 通り対象外（単一束縛のため外側の束縛名は内側 lam から見えない）。
+
+### ref（§1.5 C6）
+- `Type::Ref(Box<Type>)` / `Value::Ref(Rc<RefCell<Value>>)`。surface 型 `(ref T)`。
+- ref! / ref-get! / ref-set! は組み込みエフェクトとして EffectCall 経由で実装（effect 名 ref / ref-get / ref-set に組み込み scheme を登録、check で instantiate）。純粋 defn から呼ぶと既存のエフェクト検査により effect-violation + fix（defn→defn!）が自動で出る（テスト済み）。defn! の host ハンドラ検査は組み込みエフェクトをスキップ（host 能力ではなく言語内完結）。
+- design の `unit` 戻り値は現 SPEC に unit 型が無いため `nil` に写像（記録）。
+- `=` は参照等価（Rust は `Rc::ptr_eq`、JS は `{value}` オブジェクトに非列挙マーカ `__lists_ref__` を付けて structuralEqual で `a === b`）。設計 §1.5 の「循環 `=` は存在しない」は ref-set! で自己参照セルが作れるため反例あり。ただし参照等価なので循環検出は不要で両バックエンド一致。
+- JS 写像は design §7 通り `{ value }` オブジェクト（+ 非列挙マーカ）。ref の印字は Rust `<ref>`（JS 側の $print は `{value: ...}` となる諸元あり。example では ref を直接 str しない方針で回避。残課題として記録）。
+- ref! は defn! の do-bind 内で Result でなく生の値として束縛できる（既存の §7.4 rule 5 の仕組みをそのまま利用）。
+
+### テスト追加
+- `tests/fixtures/letrec-ref-builder.lts`（17 example: letrec 自己再帰 fact・親環境クロージャ make-adder・複数 body、builder 基本/不変性/印字/10^4 畳み込み len=38890、ref の set/get 往復・参照等価 self-eq/diff-ref・共有セル share）→ `diff::letrec_ref_builder_diff_interp_vs_backend`（interp vs compile+node 全一致、mock でも一致）
+- `acceptance::letrec_non_lam_binding_is_type_mismatch_with_fix`、`acceptance::ref_builtin_effect_violation_in_pure_defn_and_ok_in_defn_bang`
+- fmt: `fmt_letrec_and_ref_roundtrip` + fixture 一覧に letrec-ref-builder.lts 追加（冪等・AST 保存）
+
+### 検証
+- `cargo test` 261 全パス（257 + 4）、warning 0。`LISTS_BACKEND=mock` acceptance 21/21。
+- `lists compile letrec-ref-builder.lts` を2回実行しバイト一致、node で 17/17 example ok。`lists fmt` in-place 2回で安定。golden 無改変。`git diff -- SPEC.md` 空。
+
+### ギャップ・残課題（SPEC には報告のみ）
+1. §8.5 の末尾位置リストに Letrec.body が未記載 → Let.body と同じく末尾位置として実装（報告のみ、SPEC 未変更）。
+2. design の `unit`（ref-set! の戻り値）は現 SPEC に無いため nil に写像。
+3. letrec の自己末尾呼び出しは JS で self-loop 最適化せず通常再帰（defn の §8.5 最適化との差。深さに注意）。
+4. ref の印字: Rust `<ref>` / JS `{value: ...}` の差（$print は golden 都合で無改変のため）。`=` は参照等価で一致。
+5. 相互再帰 letrec は単一束縛のため不可（design §2.1「対象外」に一致）。
+
+---
+
+## 21. interp-capability §4（C9 host エフェクト now!/elapsed!/trace!）の実装判断（SPEC.md は未変更）
+
+対象: design/interp-capability.md §4。**read-file! は bytes 型が未実装（M29）のため本マイルストーンから除外し M29 に回した**（プロンプトの指示通り）。
+
+### 実装
+- `host.rs::BUILTIN_HOST_EFFECTS = ["now", "elapsed", "trace"]` を host 能力インターフェースの組み込みとして追加（read-file! は M29 後）。`effects.rs::builtin_effect_scheme` に言語側宣言済みのスキームを追加: `now! : (fn () : number)`、`elapsed! : (fn () : number)`（design の `(-> unit num)`。unit は現 SPEC に無いので 0 引数 fn に写像）、`trace! : (fn (string) : nil)`（unit→nil）。
+- エフェクト検査: 宣言なしの呼び出しは unknown-effect（既存どおり）、純粋 defn からの呼び出しは effect-violation + fix `defn!`（既存どおり。組み込みエフェクトも EffectCall なので自動）。defn! の host ハンドラ検査は組み込みエフェクトをスキップ（`is_builtin_effect` で ref 系と統合）。
+- interp（モック）: `now!` は固定列 `MOCK_NOW_BASE=1700000000000 + 呼び出し回数*1000`（Interp 内クロック、同一入力で同一出力=決定的）、`elapsed!` は `now - 初回 now`、`trace!` は `Interp.host_log`（`HostCall{effect,args}` 形式）へ蓄積し nil を返す。repl --host mock では `Interp.host_log` をモック host のログと共有するため、**host-log op に trace! も載る**（host-log は trace! の糖衣として存続。既存 golden 不変）。
+- JS バックエンド: `now!` → `Date.now()`、`elapsed!` → `Date.now() - $BOOT_NOW`（モジュール先頭で1度だけ評価する `$BOOT_NOW` を clock 使用時のみ出力）、`trace!` → `(console.error(s), null)`（console.error は undefined を返すので do の Err 検査で壊れないよう null にする。stderr に出るので example の stdout には影響しない）。
+- docs/backends.md に写像表と「read-file!（M29）で初めて Node `fs` 依存が生じる」旨を明記。現状 now!/elapsed!/trace! は Date.now/console.error のみで Node 固有 API 不要。
+
+### テスト追加
+- `tests/fixtures/hostfx.lts`（trace! のみ差分安全: run-trace/twice-trace）→ `diff::hostfx_trace_diff_interp_vs_backend`（interp vs compile+node で一致。stderr の trace は stdout 比較に影響しない）
+- `acceptance::now_elapsed_bench_is_deterministic_and_trace_is_logged`: ベンチ関数（now!→trace!→now!→elapsed!）が interp で決定的（`(ok 1000)`）＆同一入力の再実行で同一出力＆trace! が effect/args 形式で記録されること
+- `acceptance::builtin_host_effect_diagnostics`: 未宣言 `foo!` → unknown-effect、純粋 defn で `trace!` → effect-violation + fix `defn!`、defn! で now!/trace! はエラーなし
+- fmt fixture に hostfx.lts 追加（冪等）
+
+### 検証
+- `cargo test` 264 全パス（261 + 3）、warning 0。`LISTS_BACKEND=mock` acceptance 24/24。
+- `lists compile hostfx.lts` を2回実行しバイト一致、node で 3/3 example ok（trace は stderr）。`lists fmt` in-place 2回で安定。golden（repl.host-log 含む）無改変。`git diff -- SPEC.md` 空。
+
+### ギャップ・残課題（SPEC には報告のみ）
+1. read-file! / read_file: bytes 型未実装（M29）のため除外。M29 で `(effect read-file! : (fn (string) : (Result bytes (obj (tag "io-error")))))` を追加し、JS は Node fs 依存となる（docs/backends.md に明記済み）。
+2. design の `(-> unit num)` は現 SPEC に unit が無いため `(fn () : number)` に写像。同様に trace! の unit → nil。
+3. now!/elapsed! は JS（Date.now）が非決定的のため差分テスト対象外。interp のみ決定性テスト。
+4. モック now の固定列は呼び出し回数ベース（シード非依存）。「固定列 or シード由来」のうち固定列を採用。
+
+---
+
+## 22. interp-capability §1.4（C8 bytes）+ §4.1（read-file!）の実装判断（SPEC.md は未変更）
+
+### bytes（§1.4 C8）
+- `Type::Bytes` / `Value::Bytes(Rc<Vec<u8>>)`。surface 型プリム `bytes`。不変バイト列（変更操作は stdlib に存在しない）。
+- stdlib: `bytes-get : (fn (bytes number) : (Option number))`（nth と同じく小数添字は切り捨て・範囲外は nil。design は戻り値型を明記しないため配列アクセスの nth に合わせた）、`bytes-len : (fn (bytes) : number)`、`bytes-slice : (fn (bytes number number) : bytes)`（slice と同じ slice_bounds クランプ）、`str->bytes : (fn (string) : bytes)`（UTF-8、常に成功）、`bytes->str : (fn (bytes) : (Result string (obj (tag "invalid-utf8"))))`、`str->codepoints : (fn (string) : (Array number))`、`codepoints->str : (fn ((Array number)) : (Result string (obj (tag "invalid-code"))))`（各要素は整数・0..0x10FFFF・サロゲート以外）。design の `int` は number に写像（i64 は P5）。
+- `=` はバイト列の構造等価。循環は構築不可。
+- **印字規約（新規決定。§11.6 に bytes は未定義）**: `#u8[1 2 3]` 形式（空は `#u8[]`）。Rust `print_value` と JS `$print`（Uint8Array 分岐を PRINT_JS に追加）で同一バイト列。PRINT_JS 変更に伴い golden の decimal-edge.js / effect-run.js は $print 1行追加のみ（UPDATE_SNAPSHOTS で再生成し diff を確認）。
+- **JS 写像**: `Uint8Array`。`str->bytes` → `TextEncoder().encode`、`bytes->str` → `TextDecoder("utf-8", {fatal:true})`（不正なら throw → err invalid-utf8。Rust の from_utf8 と一致）、`bytes-slice` → `slice`（slice_bounds 共有）、codepoints は codePointAt/fromCodePoint。
+- JSON: bytes は数値配列として直列化（$mjson に Uint8Array 分岐追加、value_to_json も同一）。example の actual に生の bytes は出さない方針（char と同じく JSON 上は配列と区別されないため）。
+
+### read-file!（§4.1。M28 で bytes 未実装のため M29=本マイルストーンに回した）
+- `(effect read-file! : (fn (string) : (Result bytes (obj (tag "io-error")))))` を組み込みエフェクトとして登録（`is_builtin_effect` に "read-file" 追加。effect 宣言不要、host ハンドラ検査スキップ、純粋 defn からは effect-violation + fix）。
+- interp/モック: `Interp.virtual_files`（登録された仮想ファイル）から読み `(ok bytes)`、無ければ `(err (obj (tag "io-error")))`。
+- JS: `import * as $fs from "node:fs/promises"` + `$read_file`（read-file! 使用時のみ出力）。**これが初めての Node 固有 API 依存**（docs/backends.md に明記済み）。差分テストからは除外（FS は非決定的）。
+
+### テスト追加
+- `tests/fixtures/bytes-edge.lts`（30 example: 基本操作・UTF-8 往復（絵文字=4バイト）・invalid-utf8（絵文字途中バイト等）・codepoints とサロゲート境界 invalid-code・#u8 印字・等価）→ `diff::bytes_edge_diff_interp_vs_backend`（interp vs compile+node 全一致、mock でも一致）
+- `acceptance::read_file_effect_reads_virtual_files_and_io_error_on_missing`（仮想ファイルからの読み取り・missing で io-error・純粋 defn での effect-violation・JS 出力が node:fs/promises を含むこと）
+- fmt fixture に bytes-edge.lts 追加（冪等）
+
+### 検証
+- `cargo test` 266 全パス（264 + 2）、warning 0。`LISTS_BACKEND=mock` acceptance 26/26。
+- `lists compile bytes-edge.lts` を2回実行しバイト一致、node で 30/30 example ok。`lists fmt` in-place 2回で安定。golden は $print 1行追加のみ（意図的変更、diff 確認済み）。`git diff -- SPEC.md` 空。
+
+### ギャップ・残課題（SPEC には報告のみ）
+1. bytes の印字規約 `#u8[...]` は §11.6 に未定義のため新規決定（プロンプトの例示形式を採用）。SPEC 改訂時に追記候補。
+2. bytes-get の戻り値型は design が明記しないため nth と同じ `(Option number)` に決定（範囲外は nil）。char-at の `Result out-of-range` とは流儀が異なる（配列=Option、位置ベース=Result）点を記録。
+3. bytes にはソース上のリテラル構文が無い（prop の counterexample 印字は print_value 形式）。
+4. read-file! の JS 実行は差分テスト対象外（Node fs）。interp のみ仮想ファイルで決定的にテスト。
+5. $json（decimal時）の Uint8Array 分岐は $mjson のみに追加。decimal と bytes を同時に example 出力する組合せは未対応（実害なし、記録のみ）。
+
+---
+
+## 23. M22 prop の JS バックエンド実行（SPEC.md は未変更）
+
+### 方針（runtime.js の export 3つを崩さない）
+- SPEC §12.5 は runtime.js の export を ok/err/structuralEqual の3つのまま増やさない（MUST）。よって prop 用ランタイムは**別モジュール `src/backend/prop_runtime.js`** とし、prop を含む生成 .js のみが `import { runProps } from "./prop-runtime.js"` し、JsBackend はそのときだけ out_dir に prop-runtime.js を併置する（EmitOutput.uses_prop）。runtime.js は無改変。
+
+### 実装
+- **RNG**: src/rng.rs の splitmix64 を BigInt でビット一致に写像。DEFAULT_SEED=0x5EED1A7C2B219D4F は共通。同じ seed → 同じ列。
+- **codegen**: prop 本体を `$prop_<i>` 関数として出力し `$PROPS` に登録（型ディスクリプタ JSON = alias 展開済み、本体 Core は serde JSON で埋め込み）。末尾に `const $SEED = <seed>n; await runProps($PROPS, $SEED, 100);`。結果は stdout に `prop <i>: ok <json>` / `prop <i>: FAIL <json>`。
+- **生成・縮小**: gen_value/min_value/value_size/shrink_candidates を写像（境界値 NUM_BOUNDARIES・STR_CHARSET・試行100回・深さ6・縮小順序すべて interp と同一。文字列長比較は TextEncoder でバイト長に合わせた）。
+- **結果 JSON のバイト一致**: オブジェクトキーは serde_json と同じくソート（BTreeMap 既定）。数値は ryu 互換に合わせ整数 float に `.0`、NaN/±Inf は null（value_to_json と同じ）。seed は u64 なので BigInt のまま桁落ちなく直列化。id/trials は整数のまま。fix テンプレートは埋め込み core JSON 上で subst_params/print_core を写像（serde 形 Value は平坦化してから value_to_lit）。
+- **--seed**: `lists compile --seed N` を追加し Backend::compile に seed を通し EmitInput.seed → `$SEED` に埋め込む（既定 DEFAULT_SEED）。REPL は既存の --seed / prop リクエスト seed をそのまま使う（継承確認済みテスト）。
+
+### テスト追加
+- `tests/fixtures/props-edge.lts`（pass 3 + fail 1）→ `diff::prop_diff_interp_vs_node_same_seed_byte_identical`: seed=0xDEADBEEF12345678 で interp の prop_result_json と node の `prop i:` 行の JSON が**同一バイト列**（反例 {"x":1.0}・縮小 {"x":0.0}・seed・fix template を含む）、かつ同一 seed の再実行で同一 stdout（決定性）
+- `tools.rs::cli_compile_seed_is_embedded_into_codegen`: --seed 42 で `const $SEED = 42n;` が埋め込まれ prop-runtime.js が配置されること、既定は DEFAULT_SEED
+- fmt fixture に props-edge.lts 追加
+
+### 検証
+- `cargo test` 268 全パス（266 + 2）、warning 0。`LISTS_BACKEND=mock` acceptance 27/27。
+- golden: money.js のみ prop 追加分（import/$prop_0/$SEED/$PROPS/runProps）が変わる意図的変更。それ以外の golden 無改変。compile を2回実行しバイト一致。fmt in-place 冪等。`git diff -- SPEC.md` 空。
+
+### ギャップ・残課題（SPEC には報告のみ）
+1. prop の fix テンプレート（`(example ... => false)`）は埋め込み core JSON 経由の写像。Match/Do 等のフォームは print_core のフォールバック `<expr>` となる（interp と同じ）。
+2. 数値の JSON 形式は ryu/serde_json 互換をテストで担保（整数 float の `.0`、NaN/Inf→null）。指数表記（1e21 系）の ryu と V8 の差は未対応（テスト範囲外）。
+3. prop 本体が defn! を呼ぶ場合（async）は runProps が await で評価する。それ以外の差分はなし。
+4. mock バックエンドは従来通り example のみ実行（prop は REPL/interp と js で実行）。

@@ -45,6 +45,26 @@ fn comments(trivia: &Trivia, ind: &str) -> String {
     s
 }
 
+/// char リテラルの印字（`\<文字>`）。エスケープは str と共通規則の逆写像（design §1.2）。
+pub fn print_char_lit(c: char) -> String {
+    let bs = 92u8 as char; // backslash
+    let mut out = String::new();
+    out.push(bs);
+    match c {
+        '"' => out.push('"'),
+        '\u{5c}' => out.push(bs),
+        '\u{a}' => out.push('n'),
+        '\u{9}' => out.push('t'),
+        '\u{d}' => out.push('r'),
+        c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            out.push('u');
+            out += &format!("{:04x}", c as u32);
+        }
+        c => out.push(c),
+    }
+    out
+}
+
 pub fn print_string_lit(s: &str) -> String {
     let mut out = String::from("\"");
     for ch in s.chars() {
@@ -158,6 +178,7 @@ fn print_expr(e: &Expr, ind: &str) -> String {
         | Expr::FieldAccess { trivia, .. }
         | Expr::App { trivia, .. }
         | Expr::Let { trivia, .. }
+        | Expr::Letrec { trivia, .. }
         | Expr::If { trivia, .. }
         | Expr::When { trivia, .. }
         | Expr::Cond { trivia, .. }
@@ -173,6 +194,7 @@ fn print_expr(e: &Expr, ind: &str) -> String {
     let body = match e {
         Expr::Lit { value, .. } => match value {
             LitValue::Str(s) => print_string_lit(s),
+            LitValue::Char(c) => print_char_lit(*c),
             LitValue::Nil => "nil".to_string(),
             LitValue::Bool(b) => format!("{b}"),
             LitValue::Num(n) => format!("{n}"),
@@ -193,6 +215,16 @@ fn print_expr(e: &Expr, ind: &str) -> String {
                 .map(|b| format!("{} {}", b.name, print_expr(&b.expr, ind)))
                 .collect();
             join_list("let", &[format!("[{}]", binds_s.join(" ")), print_expr(body, ind)], ind)
+        }
+        Expr::Letrec {
+            name,
+            lam,
+            body,
+            ..
+        } => {
+            let mut parts = vec![format!("[{name} {}]", print_expr(lam, ind))];
+            parts.extend(body.iter().map(|e| print_expr(e, ind)));
+            join_list("letrec", &parts, ind)
         }
         Expr::If {
             cond,
@@ -304,6 +336,9 @@ fn print_type(t: &TypeExpr) -> String {
             Prim::Dec => "decimal",
             Prim::Str => "string",
             Prim::Bool => "bool",
+            Prim::Char => "char",
+            Prim::Builder => "builder",
+            Prim::Bytes => "bytes",
             Prim::Nil => "nil",
         }
         .to_string(),
@@ -324,6 +359,9 @@ fn print_type(t: &TypeExpr) -> String {
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
+        TypeExpr::Map { key, value, .. } => format!("(map {} {})", print_type(key), print_type(value)),
+        TypeExpr::Set { key, .. } => format!("(set {})", print_type(key)),
+        TypeExpr::Ref { inner, .. } => format!("(ref {})", print_type(inner)),
         TypeExpr::ResultT { ok, err, .. } => {
             format!("(Result {} {})", print_type(ok), print_type(err))
         }
@@ -345,6 +383,7 @@ fn print_pattern(p: &Pat) -> String {
         Pat::Var { name, .. } => name.to_string(),
         Pat::Lit { value, .. } => match value {
             LitValue::Str(s) => print_string_lit(s),
+            LitValue::Char(c) => print_char_lit(*c),
             LitValue::Nil => "nil".to_string(),
             LitValue::Bool(b) => format!("{b}"),
             LitValue::Num(n) => format!("{n}"),
@@ -401,7 +440,7 @@ mod tests {
 
     #[test]
     fn fmt_is_idempotent_on_fixtures() {
-        for name in ["money.lts", "cart.lts", "stock.lts", "effects.lts", "cycle-a.lts", "fact.lts"] {
+        for name in ["money.lts", "cart.lts", "stock.lts", "effects.lts", "cycle-a.lts", "fact.lts", "map-edge.lts", "char-edge.lts", "letrec-ref-builder.lts", "hostfx.lts", "bytes-edge.lts", "props-edge.lts"] {
             let src = fixture_src(name);
             let once = format_source(&src, name);
             assert!(once.diagnostics.is_empty(), "{name}: {:?}", once.diagnostics);
@@ -413,11 +452,49 @@ mod tests {
 
     #[test]
     fn fmt_preserves_ast_on_fixtures() {
-        for name in ["money.lts", "cart.lts", "stock.lts", "effects.lts"] {
+        for name in ["money.lts", "cart.lts", "stock.lts", "effects.lts", "map-edge.lts", "char-edge.lts", "letrec-ref-builder.lts", "hostfx.lts", "bytes-edge.lts", "props-edge.lts"] {
             let src = fixture_src(name);
             let once = format_source(&src, name).output;
             assert_eq!(ast_json(&src, name), ast_json(&once, name), "{name}");
         }
+    }
+
+    #[test]
+    fn fmt_letrec_and_ref_roundtrip() {
+        let src = "(defn f (n : number) : number\n  (letrec [g (fn (k : number) : number k)] (g n)))\n\
+                   (defn! h (host : (obj)) : (ref number) (ref! 0))\n";
+        let once = format_source(src, "t.lts").output;
+        assert!(once.contains("(letrec [g (fn (k : number) : number k)]"), "{once}");
+        assert!(once.contains("(ref! 0)"), "{once}");
+        assert!(once.contains("(ref number)"), "{once}");
+        let twice = format_source(&once, "t.lts").output;
+        assert_eq!(once, twice, "fmt は冪等");
+        assert_eq!(ast_json(src, "t.lts"), ast_json(&once, "t.lts"));
+    }
+
+    #[test]
+    fn fmt_char_literal_roundtrip() {
+        let src = "(defn f (c : char) : number (char-code \\a))\n(example (char-code \\u0041) => 65)\n";
+        let once = format_source(src, "t.lts").output;
+        assert!(once.contains("\\a"), "{once}");
+        assert!(once.contains("(c : char)"), "{once}");
+        let twice = format_source(&once, "t.lts").output;
+        assert_eq!(once, twice, "fmt は冪等");
+        // エスケープが正しく往復すること（AST 保存）
+        assert_eq!(ast_json(src, "t.lts"), ast_json(&once, "t.lts"));
+    }
+
+    #[test]
+    fn fmt_map_set_type_syntax() {
+        let out = format_source(
+            "(defn f (m : (map string number)) (s : (set number)) : number 1)",
+            "t.lts",
+        )
+        .output;
+        assert!(out.contains("(m : (map string number))"), "{out}");
+        assert!(out.contains("(s : (set number))"), "{out}");
+        let twice = format_source(&out, "t.lts").output;
+        assert_eq!(out, twice, "fmt は冪等");
     }
 
     #[test]

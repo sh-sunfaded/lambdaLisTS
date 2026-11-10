@@ -110,6 +110,38 @@ fn repl_json_lines_golden() {
 }
 
 #[test]
+// compile --seed は prop のシードを codegen 出力へ $SEED として埋め込む（REPL --seed と同じ既定値）
+#[test]
+fn cli_compile_seed_is_embedded_into_codegen() {
+    let dir = temp_dir("compile-seed");
+    let props = fixture_path("props-edge.lts");
+    let out_dir = dir.join("out");
+    let out = run_lists(
+        &[
+            "compile",
+            &props,
+            "--out",
+            out_dir.to_str().expect("utf8"),
+            "--seed",
+            "42",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let js = std::fs::read_to_string(out_dir.join("props-edge.js")).expect("js");
+    assert!(js.contains("const $SEED = 42n;"), "{js}");
+    assert!(js.contains("prop-runtime.js"), "{js}");
+    assert!(out_dir.join("prop-runtime.js").exists(), "prop-runtime.js が配置される");
+    // 既定（--seed なし）は DEFAULT_SEED
+    let dir2 = temp_dir("compile-seed-default");
+    let out_dir2 = dir2.join("out");
+    let out2 = run_lists(&["compile", &props, "--out", out_dir2.to_str().expect("utf8")], None);
+    assert_eq!(out2.status.code(), Some(0));
+    let js2 = std::fs::read_to_string(out_dir2.join("props-edge.js")).expect("js");
+    let default_seed = lists::rng::DEFAULT_SEED;
+    assert!(js2.contains(&format!("const $SEED = {default_seed}n;")), "{js2}");
+}
+
 fn cli_compile_money_cart_out_dir_and_node_run() {
     let dir = temp_dir("compile");
     let money = fixture_path("money.lts");

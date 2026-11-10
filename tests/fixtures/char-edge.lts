@@ -1,0 +1,93 @@
+;; char-edge.lts — design/interp-capability.md §1.2/§3.1（C2 char + 文字列プリミティブ）の差分テスト fixture。
+;; char は Unicode スカラー値1つ（サロゲートなし）。リテラルは \<文字>（str リテラルと同じエスケープ規則）。
+;; 位置はすべてスカラー値（char）単位。JS バックエンドでは char = 1要素文字列（コードポイント単位）。
+
+;; --- リテラルと基本述語 ---
+(example (char-code \a) => 97)
+(example (char-code \A) => 65)
+(example (char-code \😀) => 128512)
+(example (char-code \￿) => 65535)
+(example (char-code \n) => 10)
+(example (char-code \u0041) => 65)
+(example (char=? \a \a) => true)
+(example (char=? \a \b) => false)
+(example (char=? \😀 \😀) => true)
+(example (char<=? \a \b) => true)
+(example (char<=? \b \a) => false)
+(example (char<=? \a \a) => true)
+(example (char<=? \😀 \￿) => false)
+(example (char-alphabetic? \a) => true)
+(example (char-alphabetic? \あ) => true)
+(example (char-alphabetic? \1) => false)
+(example (char-numeric? \1) => true)
+(example (char-numeric? \a) => false)
+(example (char-whitespace? \ ) => true)
+(example (char-whitespace? \n) => true)
+(example (char-whitespace? \a) => false)
+(example (= \a \a) => true)
+(example (= \a \b) => false)
+
+;; --- code->char の境界（result 往復。サロゲートは存在しない） ---
+(example (= (code->char 97) (ok \a)) => true)
+(example (= (code->char 128512) (ok \😀)) => true)
+(example (= (code->char 0) (ok \u0000)) => true)
+(example (= (code->char 55296) (err (obj (tag "invalid-code")))) => true)
+(example (= (code->char 57343) (err (obj (tag "invalid-code")))) => true)
+(example (= (code->char 1114112) (err (obj (tag "invalid-code")))) => true)
+(example (= (code->char -1) (err (obj (tag "invalid-code")))) => true)
+(example (= (code->char 65.5) (err (obj (tag "invalid-code")))) => true)
+(example (= (code->char (/ 0 0)) (err (obj (tag "invalid-code")))) => true)
+
+;; --- char-at（スカラー値境界・out-of-range） ---
+(example (= (char-at "abc" 0) (ok \a)) => true)
+(example (= (char-at "a😀b" 1) (ok \😀)) => true)
+(example (= (char-at "a😀b" 2) (ok \b)) => true)
+(example (= (char-at "abc" 1.9) (ok \b)) => true)
+(example (= (char-at "ab" 2) (err (obj (tag "out-of-range")))) => true)
+(example (= (char-at "ab" -1) (err (obj (tag "out-of-range")))) => true)
+(example (= (char-at "ab" (/ 0 0)) (err (obj (tag "out-of-range")))) => true)
+(example (= (char-at "" 0) (err (obj (tag "out-of-range")))) => true)
+
+;; --- 位置ベース API: 簡単なレキサー（空白スキップ + 数字列読み取り） ---
+(defn skip-ws (s : string) (i : number) : number
+  (str-skip-while s i (fn (c : char) : bool (char-whitespace? c))))
+
+(defn read-digits (s : string) (i : number) : (obj (acc : string) (pos : number))
+  (str-take-while s i (fn (c : char) : bool (char-numeric? c))))
+
+(example (skip-ws "  abc" 0) => 2)
+(example (skip-ws "abc" 0) => 0)
+(example (skip-ws "  " 0) => 2)
+(example (skip-ws "a😀 b" 2) => 3)
+(example (read-digits "123abc" 0) => (obj (acc "123") (pos 3)))
+(example (read-digits "abc" 0) => (obj (acc "") (pos 0)))
+(example (read-digits "😀1a" 1) => (obj (acc "1") (pos 2)))
+(example (str-take-while "a😀b" 0 (fn (c : char) : bool (char<=? c \a))) => (obj (acc "a") (pos 1)))
+
+;; --- str-split-at ---
+(example (= (str-split-at "a😀b" 1) (ok (obj (left "a") (right "😀b")))) => true)
+(example (= (str-split-at "ab" 2) (ok (obj (left "ab") (right "")))) => true)
+(example (= (str-split-at "ab" 0) (ok (obj (left "") (right "ab")))) => true)
+(example (= (str-split-at "ab" 5) (err (obj (tag "out-of-range")))) => true)
+(example (= (str-split-at "ab" -1) (err (obj (tag "out-of-range")))) => true)
+(example (= (str-split-at "ab" (/ 0 0)) (err (obj (tag "out-of-range")))) => true)
+
+;; --- str-contains? ---
+(example (str-contains? "abc" "b") => true)
+(example (str-contains? "abc" "x") => false)
+(example (str-contains? "a😀b" "😀") => true)
+(example (str-contains? "abc" "") => true)
+
+;; --- char を含む union と match パターン ---
+(type CV (union char number))
+(defn describe (x : CV) : string
+  (match x
+    [\a "a!"]
+    [_ "other"]))
+(example (describe \a) => "a!")
+(example (describe \b) => "other")
+(example (describe 5) => "other")
+
+;; --- 印字（§11.6: string と同じく生文字。リテラル構文のみ \<文字>） ---
+(example (str \a) => "a")
+(example (str \😀) => "😀")

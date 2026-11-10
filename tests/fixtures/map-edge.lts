@@ -1,0 +1,92 @@
+;; map-edge.lts — design/interp-capability.md §1.1（map/set、C1）の差分テスト fixture。
+;; - 型: (map K V) / (set K)（キーは string/number のみ）
+;; - 永続構造: 更新は新しい map を返し既存は不変
+;; - map-keys / set->array は挿入順（決定性）
+;; - = は構造的等価（キー集合と値で決まり順序は無視）
+;; - obj->map は単方向変換（キーはソート順）
+;; - map を末尾再帰で畳み込む例（SPEC §8.5 との組み合わせ）
+
+;; --- 基本操作 ---
+(example (map-size (map-empty)) => 0)
+(example (map-keys (map-empty)) => (array))
+(example (map-has? (map-empty) "a") => false)
+(example (map-get (map-empty) "x") => (err (obj (tag "not-found"))))
+
+;; 挿入順の決定性: map-keys は挿入順
+(example (map-keys (map-set (map-set (map-empty) "b" 2) "a" 1)) => (array "b" "a"))
+(example (map-size (map-set (map-set (map-empty) "b" 2) "a" 1)) => 2)
+(example (map-get (map-set (map-set (map-empty) "b" 2) "a" 1) "a") => (ok 1))
+(example (map-has? (map-set (map-empty) "a" 1) "b") => false)
+
+;; 上書きは値のみ変え、順序は維持（永続: 元 map は不変）
+(example (map-size (map-set (map-set (map-empty) "a" 1) "a" 2)) => 1)
+(example (map-get (map-set (map-set (map-empty) "a" 1) "a" 2) "a") => (ok 2))
+(example (map-keys (map-set (map-set (map-set (map-empty) "b" 1) "a" 2) "b" 9)) => (array "b" "a"))
+
+;; map-del は残りの挿入順を維持
+(example (map-keys (map-del (map-set (map-set (map-empty) "a" 1) "b" 2) "a")) => (array "b"))
+(example (map-size (map-del (map-set (map-empty) "a" 1) "zzz")) => 1)
+
+;; number キー（-0 と +0 は同一キー。JS Map の SameValueZero と一致）
+(example (map-keys (map-set (map-set (map-empty) 2 "two") 1 "one")) => (array 2 1))
+(example (map-size (map-set (map-set (map-empty) -0 "a") 0 "b")) => 1)
+(example (map-get (map-set (map-set (map-empty) -0 "a") 0 "b") 0) => (ok "b"))
+(example (map-get (map-set (map-empty) 1.5 "x") 1.5) => (ok "x"))
+
+;; --- set ---
+(example (set->array (set-empty)) => (array))
+(example (set->array (set-add (set-add (set-empty) 2) 1)) => (array 2 1))
+(example (set->array (set-add (set-add (set-empty) 1) 1)) => (array 1))
+(example (set-has? (set-add (set-empty) "a") "a") => true)
+(example (set-has? (set-add (set-empty) "a") "b") => false)
+
+;; --- 構造的等価（§8.3 + design §1.1: キー集合と値で決まり、順序は無視） ---
+(example (= (map-set (map-set (map-empty) "a" 1) "b" 2)
+            (map-set (map-set (map-empty) "b" 2) "a" 1)) => true)
+(example (= (map-set (map-empty) "a" 1) (map-set (map-empty) "a" 2)) => false)
+(example (= (map-set (map-empty) "a" 1) (map-set (map-set (map-empty) "a" 1) "b" 2)) => false)
+(example (= (map-set (map-empty) "a" (array 1 2)) (map-set (map-empty) "a" (array 1 2))) => true)
+(example (= (set-add (set-add (set-empty) 1) 2) (set-add (set-add (set-empty) 2) 1)) => true)
+(example (= (set-add (set-empty) 1) (set-add (set-empty) 2)) => false)
+;; ネストした map の再帰的等価
+(example (= (map-set (map-empty) "m" (map-set (map-empty) "a" 1))
+            (map-set (map-empty) "m" (map-set (map-empty) "a" 1))) => true)
+
+;; --- 永続性: 更新は新しい map を返し、既存の共有構造を壊さない ---
+(defn check-persist () : bool
+  (let [m (map-set (map-empty) "a" 1)]
+    (let [m2 (map-set m "b" 2)]
+      (and (and (= (map-size m) 1) (= (map-keys m) (array "a")))
+           (and (= (map-size m2) 2) (= (map-keys m2) (array "a" "b")))))))
+(example (check-persist) => true)
+
+;; --- obj->map（単方向変換。obj は固定キー構造体型のまま存続） ---
+(example (map-keys (obj->map (obj (b 2) (a 1)))) => (array "a" "b"))
+(example (map-get (obj->map (obj (a 1) (b "x"))) "b") => (ok "x"))
+(example (map-size (obj->map (obj (a 1) (b 2) (c 3)))) => 3)
+(example (map-has? (obj->map (obj (a 1))) "a") => true)
+
+;; --- 印字（str は print_value 規約。map/set は挿入順の s 式。REPORT.md に記録） ---
+(example (str (map-set (map-set (map-empty) "b" 2) "a" 1)) => "(map (b 2) (a 1))")
+(example (str (map-empty)) => "(map)")
+(example (str (set-add (set-add (set-empty) "x") "a")) => "(set x a)")
+(example (str (set-empty)) => "(set)")
+(example (str (map-set (map-empty) 1.5 0)) => "(map (1.5 0))")
+
+;; --- map を末尾再帰の fold で畳み込む（SPEC §8.5: 末尾 App はスタック消費なし） ---
+(defn build (i : number) (m : (map number number)) : (map number number)
+  (if (< i 2000) (build (+ i 1) (map-set m i (* i 2))) m))
+
+(defn sum-loop (ks : (Array number)) (i : number) (m : (map number number)) (acc : number)
+                : (Result number (obj (tag "not-found")))
+  (if (< i (count ks))
+    (do [v (map-get m (nth ks i))]
+      (sum-loop ks (+ i 1) m (+ acc v)))
+    (ok acc)))
+
+(defn total (m : (map number number)) : (Result number (obj (tag "not-found")))
+  (sum-loop (map-keys m) 0 m 0))
+
+;; sum_{i=0}^{1999} 2i = 3998000。2000 回の末尾再帰 + map-set 2000 回。
+(example (total (build 0 (map-empty))) => (ok 3998000))
+(example (map-size (build 0 (map-empty))) => 2000)

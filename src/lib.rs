@@ -16,6 +16,7 @@ pub mod ir;
 pub mod lexer;
 pub mod names;
 pub mod parser;
+pub mod pmap;
 pub mod prop;
 pub mod repl;
 pub mod resolver;

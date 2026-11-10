@@ -1,0 +1,19 @@
+;; hostfx.lts — design/interp-capability.md §4（C9: now!/elapsed!/trace!）の差分テスト fixture。
+;; read-file! は bytes 型未実装（M29 行き）のため対象外。
+;; JS 差分テスト対象は trace! のみ（now!/elapsed! は JS 側が Date.now 由来で非決定的のため interp 側のみテスト）。
+
+;; trace! は host-log の糖衣（design §4）。JS では console.error（stderr）なので stdout の example には影響しない。
+(defn! run-trace (host : (obj)) (s : string) : (Result string nil)
+  (do [_ (trace! s)]
+    (ok (str-concat "traced:" s))))
+
+(example (run-trace (obj) "hello") => (ok "traced:hello"))
+(example (run-trace (obj) "a😀") => (ok "traced:a😀"))
+
+;;組み込みエフェクトは defn! の host ハンドラ検査を要しない（host : (obj) のまま使える）
+(defn! twice-trace (host : (obj)) (s : string) : (Result number nil)
+  (do [_ (trace! s)]
+    (do [_ (trace! (str-concat s s))]
+      (ok (len s)))))
+
+(example (twice-trace (obj) "ab") => (ok 2))

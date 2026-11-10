@@ -15,14 +15,14 @@ const TOP_HEADS: &[&str] = &[
     "defn", "defn!", "type", "effect", "import", "export", "prop", "example",
 ];
 const SPECIAL_HEADS: &[&str] = &[
-    "let", "if", "when", "cond", "and", "or", "match", "do", "obj", "fn",
+    "let", "letrec", "if", "when", "cond", "and", "or", "match", "do", "obj", "fn",
 ];
 const RESERVED: &[&str] = &[
     "defn", "defn!", "fn", "let", "if", "when", "cond", "and", "or", "match", "do", "obj",
     "type", "effect", "prop", "forall", "example", "import", "export", "Array", "union",
-    "Result", "Option",
+    "Result", "Option", "letrec",
 ];
-const PRIMS: &[&str] = &["number", "string", "bool", "decimal"];
+const PRIMS: &[&str] = &["number", "string", "bool", "decimal", "char", "builder", "bytes"];
 const OPERATORS: &[&str] = &["+", "-", "*", "/", "<", ">", "<=", ">=", "="];
 
 fn is_reserved(text: &str) -> bool {
@@ -824,6 +824,9 @@ impl<'a> Parser<'a> {
                             "decimal" => Prim::Dec,
                             "string" => Prim::Str,
                             "bool" => Prim::Bool,
+                            "char" => Prim::Char,
+                            "builder" => Prim::Builder,
+                            "bytes" => Prim::Bytes,
                             _ => Prim::Nil,
                         };
                         TypeExpr::Prim {
@@ -985,6 +988,68 @@ impl<'a> Parser<'a> {
                         }
                         TypeExpr::Obj {
                             fields,
+                            trivia: l.trivia.clone(),
+                            span: l.span.clone(),
+                        }
+                    }
+                    "map" => {
+                        if args.len() != 2 {
+                            self.error(
+                                l.span.clone(),
+                                "map は (map K V) 形です".to_string(),
+                                Some(json!({ "expected": 2, "actual": args.len() })),
+                                None,
+                            );
+                        }
+                        let key = match args.first() {
+                            Some(a) => self.build_type(a, &format!("{path}.key")),
+                            None => type_error("キー型がありますません", l.span.clone(), l.trivia.clone()),
+                        };
+                        let value = match args.get(1) {
+                            Some(a) => self.build_type(a, &format!("{path}.value")),
+                            None => type_error("値型がありますません", l.span.clone(), l.trivia.clone()),
+                        };
+                        TypeExpr::Map {
+                            key: Box::new(key),
+                            value: Box::new(value),
+                            trivia: l.trivia.clone(),
+                            span: l.span.clone(),
+                        }
+                    }
+                    "set" => {
+                        if args.len() != 1 {
+                            self.error(
+                                l.span.clone(),
+                                "set は (set K) 形です".to_string(),
+                                Some(json!({ "expected": 1, "actual": args.len() })),
+                                None,
+                            );
+                        }
+                        let key = match args.first() {
+                            Some(a) => self.build_type(a, &format!("{path}.key")),
+                            None => type_error("キー型がありますません", l.span.clone(), l.trivia.clone()),
+                        };
+                        TypeExpr::Set {
+                            key: Box::new(key),
+                            trivia: l.trivia.clone(),
+                            span: l.span.clone(),
+                        }
+                    }
+                    "ref" => {
+                        if args.len() != 1 {
+                            self.error(
+                                l.span.clone(),
+                                "ref は (ref T) 形です".to_string(),
+                                Some(json!({ "expected": 1, "actual": args.len() })),
+                                None,
+                            );
+                        }
+                        let inner = match args.first() {
+                            Some(a) => self.build_type(a, &format!("{path}.inner")),
+                            None => type_error("要素型がありますません", l.span.clone(), l.trivia.clone()),
+                        };
+                        TypeExpr::Ref {
+                            inner: Box::new(inner),
                             trivia: l.trivia.clone(),
                             span: l.span.clone(),
                         }
@@ -1266,6 +1331,17 @@ impl<'a> Parser<'a> {
                     span: t.span.clone(),
                 }
             }
+            TokenKind::Char => {
+                let c = match &t.value {
+                    Some(TokenValue::Char(c)) => *c,
+                    _ => 'a',
+                };
+                Expr::Lit {
+                    value: LitValue::Char(c),
+                    trivia: t.trivia.clone(),
+                    span: t.span.clone(),
+                }
+            }
             TokenKind::Nil => Expr::Lit {
                 value: LitValue::Nil,
                 trivia: t.trivia.clone(),
@@ -1390,6 +1466,79 @@ impl<'a> Parser<'a> {
                 Expr::Let {
                     binds,
                     body: Box::new(body),
+                    trivia: raw.trivia.clone(),
+                    span: raw.span.clone(),
+                }
+            }
+            "letrec" => {
+                // (letrec [name lam-expr] body...) — design/interp-capability.md §2.1
+                if args.is_empty() {
+                    self.error(
+                        raw.span.clone(),
+                        "letrec は (letrec [name lam] body...) 形です".to_string(),
+                        None,
+                        None,
+                    );
+                    return err_node("letrec の構文が不正です", raw);
+                }
+                let vec = match as_list(&args[0]) {
+                    Some(l) if l.bracket => l,
+                    _ => {
+                        self.error(
+                            raw.span.clone(),
+                            "letrec は (letrec [name lam] body...) 形です".to_string(),
+                            None,
+                            None,
+                        );
+                        return err_node("letrec の束縛は [name lam] 形です", raw);
+                    }
+                };
+                if vec.items.len() != 2 {
+                    self.error(
+                        vec.span.clone(),
+                        "letrec の束縛は [name lam] の1ペアです".to_string(),
+                        Some(json!({ "expected": 2, "actual": vec.items.len() })),
+                        None,
+                    );
+                }
+                let name_tok = match as_atom(&vec.items[0]) {
+                    Some(t) if is_symbol_tok(t) => t,
+                    _ => {
+                        self.error(
+                            self.raw_span_of(&vec.items[0]),
+                            "letrec の束縛名はシンボルです".to_string(),
+                            None,
+                            None,
+                        );
+                        return err_node("letrec の束縛名が不正です", raw);
+                    }
+                };
+                if is_reserved(&name_tok.text) {
+                    self.error(
+                        name_tok.span.clone(),
+                        format!("予約語 '{}' は束縛名に使えません", name_tok.text),
+                        None,
+                        None,
+                    );
+                }
+                let lam = self.build_expr(&vec.items[1], &format!("{path}.lam"));
+                let body: Vec<Expr> = args[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| self.build_expr(a, &format!("{path}.body.{i}")))
+                    .collect();
+                if body.is_empty() {
+                    self.error(
+                        raw.span.clone(),
+                        "letrec には body が1つ以上必要です".to_string(),
+                        None,
+                        None,
+                    );
+                }
+                Expr::Letrec {
+                    name: name_tok.text.clone(),
+                    lam: Box::new(lam),
+                    body,
                     trivia: raw.trivia.clone(),
                     span: raw.span.clone(),
                 }
@@ -1751,6 +1900,17 @@ impl<'a> Parser<'a> {
                     };
                     Pat::Lit {
                         value: LitValue::Str(s),
+                        trivia: t.trivia.clone(),
+                        span: t.span.clone(),
+                    }
+                }
+                TokenKind::Char => {
+                    let c = match &t.value {
+                        Some(TokenValue::Char(c)) => *c,
+                        _ => 'a',
+                    };
+                    Pat::Lit {
+                        value: LitValue::Char(c),
                         trivia: t.trivia.clone(),
                         span: t.span.clone(),
                     }

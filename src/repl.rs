@@ -192,6 +192,10 @@ impl Repl {
         let all = self.defs.clone();
         load_defs(&all, &self.env);
         let mut interp = Interp::new();
+        // design §4: trace! の記録をモック host の host-log と共有する
+        if let Some(mock) = &self.mock {
+            interp.set_host_log(mock.log_handle());
+        }
         match run_examples(&mut interp, &all, &self.env) {
             Ok(results) => {
                 if results.iter().all(|r| r.pass) {

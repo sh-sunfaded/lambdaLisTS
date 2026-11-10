@@ -18,6 +18,9 @@ pub fn occurs(id: usize, t: &Type, subst: &Subst) -> bool {
     match &p {
         Type::Var(v) => *v == id,
         Type::Array(el) => occurs(id, el, subst),
+        Type::Map(k, v) => occurs(id, k, subst) || occurs(id, v, subst),
+        Type::Set(k) => occurs(id, k, subst),
+        Type::Ref(inner) => occurs(id, inner, subst),
         Type::Union(members) => members.iter().any(|m| occurs(id, m, subst)),
         Type::Obj(fields) => fields.values().any(|v| occurs(id, v, subst)),
         Type::ResultT(ok, err) => occurs(id, ok, subst) || occurs(id, err, subst),
@@ -33,6 +36,9 @@ pub fn apply_subst(t: &Type, subst: &Subst) -> Type {
     match &p {
         Type::Var(_) => p,
         Type::Array(el) => Type::Array(Box::new(apply_subst(el, subst))),
+        Type::Map(k, v) => Type::Map(Box::new(apply_subst(k, subst)), Box::new(apply_subst(v, subst))),
+        Type::Set(k) => Type::Set(Box::new(apply_subst(k, subst))),
+        Type::Ref(inner) => Type::Ref(Box::new(apply_subst(inner, subst))),
         Type::Union(members) => Type::Union(members.iter().map(|m| apply_subst(m, subst)).collect()),
         Type::Obj(fields) => Type::Obj(
             fields
@@ -132,9 +138,25 @@ pub fn unify(a0: &Type, b0: &Type, subst: &mut Subst, aliases: &AliasEnv) -> Opt
         | (Type::Dec, Type::Dec)
         | (Type::Str, Type::Str)
         | (Type::Bool, Type::Bool)
+        | (Type::Char, Type::Char)
         | (Type::Nil, Type::Nil) => Some(a.clone()),
         (Type::Literal(x), Type::Literal(y)) if x == y => Some(a.clone()),
         (Type::Array(x), Type::Array(y)) => unify(x, y, subst, aliases),
+        (Type::Map(xk, xv), Type::Map(yk, yv)) => {
+            unify(xk, yk, subst, aliases)?;
+            unify(xv, yv, subst, aliases)?;
+            Some(a.clone())
+        }
+        (Type::Set(x), Type::Set(y)) => {
+            unify(x, y, subst, aliases)?;
+            Some(a.clone())
+        }
+        (Type::Ref(x), Type::Ref(y)) => {
+            unify(x, y, subst, aliases)?;
+            Some(a.clone())
+        }
+        (Type::Builder, Type::Builder) => Some(a.clone()),
+        (Type::Bytes, Type::Bytes) => Some(a.clone()),
         (Type::Obj(fa), Type::Obj(fb)) => {
             for (k, bv) in fb {
                 let av = fa.get(k)?;
@@ -175,6 +197,12 @@ mod tests {
     }
     fn arr(el: Type) -> Type {
         Type::Array(Box::new(el))
+    }
+    fn map_t(k: Type, v: Type) -> Type {
+        Type::Map(Box::new(k), Box::new(v))
+    }
+    fn set_t(k: Type) -> Type {
+        Type::Set(Box::new(k))
     }
     fn union(ms: Vec<Type>) -> Type {
         Type::Union(ms)
@@ -278,6 +306,48 @@ mod tests {
         assert!(u(&v(1), &arr(Type::Number), &mut s2, &e));
         assert!(u(&v(1), &arr(Type::Number), &mut s2, &e));
         assert!(!u(&v(1), &Type::Str, &mut s2, &e));
+    }
+
+    #[test]
+    fn map_and_set_unify() {
+        let e = AliasEnv::new();
+        assert!(u(
+            &map_t(Type::Str, Type::Number),
+            &map_t(Type::Str, Type::Number),
+            &mut vec![],
+            &e
+        ));
+        assert!(!u(
+            &map_t(Type::Str, Type::Number),
+            &map_t(Type::Bool, Type::Number),
+            &mut vec![],
+            &e
+        ));
+        assert!(!u(
+            &map_t(Type::Str, Type::Number),
+            &set_t(Type::Str),
+            &mut vec![],
+            &e
+        ));
+        assert!(!u(&set_t(Type::Str), &map_t(Type::Str, Type::Nil), &mut vec![], &e));
+        // 変数キーは unify で具体化される
+        let mut s: Subst = Vec::new();
+        assert!(u(
+            &map_t(v(1), v(2)),
+            &map_t(Type::Str, Type::Number),
+            &mut s,
+            &e
+        ));
+        assert_eq!(prune(&v(1), &s), Type::Str);
+        assert_eq!(prune(&v(2), &s), Type::Number);
+        // occurs check: (map ?1 ?1) vs (map string (map string ?1)) は失敗
+        let mut s2: Subst = Vec::new();
+        assert!(!u(
+            &map_t(v(1), v(1)),
+            &map_t(Type::Str, map_t(Type::Str, v(1))),
+            &mut s2,
+            &e
+        ));
     }
 
     #[test]

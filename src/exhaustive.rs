@@ -21,6 +21,8 @@ fn lit_type_of(value: &Value) -> Type {
         Value::Dec(_) => Type::Dec,
         Value::Str(s) => Type::Literal(s.clone()),
         Value::Num(_) => Type::Number,
+        Value::Char(_) => Type::Char,
+        Value::Bool(_) => Type::Bool,
         _ => Type::Bool,
     }
 }

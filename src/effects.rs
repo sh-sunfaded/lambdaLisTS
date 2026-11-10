@@ -7,6 +7,75 @@ use crate::desugar::CoreDef;
 use crate::diagnostic::{DiagKind, Diagnostic, Patch, Severity};
 use crate::ir::Core;
 use crate::span::Span;
+use crate::types::{Scheme, Type};
+
+/// design/interp-capability.md §1.5: ref は host 能力ではなく言語内完結の組み込みエフェクト。
+/// effect 宣言なしで使える組み込みエフェクトのスキーム。
+pub fn builtin_effect_scheme(name: &str) -> Option<Scheme> {
+    let v = |id: usize| Type::Var(id);
+    match name {
+        // ref! : (fn (v) : (ref v))
+        "ref" => Some(Scheme {
+            vars: vec![1],
+            body: Type::FnT(vec![v(1)], Box::new(Type::Ref(Box::new(v(1))))),
+        }),
+        // ref-get! : (fn ((ref v)) : v)
+        "ref-get" => Some(Scheme {
+            vars: vec![1],
+            body: Type::FnT(vec![Type::Ref(Box::new(v(1)))], Box::new(v(1))),
+        }),
+        // ref-set! : (fn ((ref v) v) : unit) — 現 SPEC に unit は無いので nil（REPORT.md 記録）
+        "ref-set" => Some(Scheme {
+            vars: vec![1],
+            body: Type::FnT(
+                vec![Type::Ref(Box::new(v(1))), v(1)],
+                Box::new(Type::Nil),
+            ),
+        }),
+        // design §4: M20 host 能力の組み込みエフェクト（言語側で宣言済みとして扱う）。
+        // now! : (fn () : num) — design の (-> unit num)。elapsed! も同じ。
+        "now" => Some(Scheme {
+            vars: vec![],
+            body: Type::FnT(vec![], Box::new(Type::Number)),
+        }),
+        "elapsed" => Some(Scheme {
+            vars: vec![],
+            body: Type::FnT(vec![], Box::new(Type::Number)),
+        }),
+        // trace! : (fn (str) : unit) → nil。host-log の糖衣（design §4）。
+        "trace" => Some(Scheme {
+            vars: vec![],
+            body: Type::FnT(vec![Type::Str], Box::new(Type::Nil)),
+        }),
+        // §4.1: read-file! : (fn (string) : (Result bytes (obj (tag "io-error"))))（M29 で bytes 実装時に有効化）
+        "read-file" => Some(Scheme {
+            vars: vec![],
+            body: Type::FnT(
+                vec![Type::Str],
+                Box::new(Type::ResultT(
+                    Box::new(Type::Bytes),
+                    Box::new(Type::Obj(BTreeMap::from([(
+                        Rc::from("tag"),
+                        Type::Literal(Rc::from("io-error")),
+                    )]))),
+                )),
+            ),
+        }),
+        _ => None,
+    }
+}
+
+/// 組み込みエフェクト（ref 系 + host 能力 now/elapsed/trace/read-file）。effect 宣言不要・host ハンドラ不要。
+pub fn is_builtin_effect(name: &str) -> bool {
+    matches!(
+        name,
+        "ref" | "ref-get" | "ref-set" | "now" | "elapsed" | "trace" | "read-file"
+    )
+}
+
+pub fn is_builtin_ref_effect(name: &str) -> bool {
+    matches!(name, "ref" | "ref-get" | "ref-set")
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectCallSite {
@@ -48,6 +117,10 @@ pub fn find_effect_calls(e: &Core, out: &mut Vec<EffectCallSite>) {
         }
         Core::Let { rhs, body, .. } => {
             find_effect_calls(rhs, out);
+            find_effect_calls(body, out);
+        }
+        Core::Letrec { lam, body, .. } => {
+            find_effect_calls(lam, out);
             find_effect_calls(body, out);
         }
         Core::If {
@@ -101,6 +174,10 @@ pub fn find_defn_calls(e: &Core, out: &mut Vec<DefnCallSite>) {
         Core::Lam { body, .. } => find_defn_calls(body, out),
         Core::Let { rhs, body, .. } => {
             find_defn_calls(rhs, out);
+            find_defn_calls(body, out);
+        }
+        Core::Letrec { lam, body, .. } => {
+            find_defn_calls(lam, out);
             find_defn_calls(body, out);
         }
         Core::If {

@@ -5,6 +5,7 @@ function $print(v) {
   if (typeof v === "number") return $print_num(v);
   if (typeof v === "boolean") return v ? "true" : "false";
   if (Array.isArray(v)) return "[" + v.map($print).join(" ") + "]";
+  if (v instanceof Uint8Array) return "#u8[" + [...v].join(" ") + "]";
   if (typeof v === "object") {
     if (v.tag === "Ok" && Object.keys(v).length === 2 && "value" in v) return "(ok " + $print(v.value) + ")";
     if (v.tag === "Err" && Object.keys(v).length === 2 && "value" in v) return "(err " + $print(v.value) + ")";

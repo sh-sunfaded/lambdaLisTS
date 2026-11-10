@@ -1,0 +1,8 @@
+;; props-edge.lts — M22 prop の JS バックエンド差分テスト fixture。
+;; 同一 seed で interp（REPL prop）と compile+node の結果 JSON（反例・縮小・seed 含む）が同一バイト列になること。
+
+(prop "add commutative" (forall [(a : number) (b : number)] (= (+ a b) (+ b a))))
+(prop "double equals sum" (forall [(x : number)] (= (* 2 x) (+ x x))))
+(prop "string identity" (forall [(s : string)] (= s s)))
+;; 常に失敗するので反例・縮小が出る（x は 0 へ縮小される）
+(prop "never equal" (forall [(x : number)] (= x (+ x 1))))

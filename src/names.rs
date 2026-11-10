@@ -183,6 +183,19 @@ impl<'a> Walker<'a> {
                 }
                 self.expr(body, &ast_path(path, &["body"]));
             }
+            Expr::Letrec {
+                name,
+                lam,
+                body,
+                span,
+                ..
+            } => {
+                self.report(name, span, ast_path(path, &["name"]), true);
+                self.expr(lam, &ast_path(path, &["lam"]));
+                for (i, e) in body.iter().enumerate() {
+                    self.expr(e, &ast_path(path, &["body", &i.to_string()]));
+                }
+            }
             Expr::Do { binds, body, .. } => {
                 for (i, b) in binds.iter().enumerate() {
                     let bp = ast_path(path, &["binds", &i.to_string()]);
@@ -280,6 +293,12 @@ impl<'a> Walker<'a> {
                 self.report(name, span, path.to_string(), false)
             }
             TypeExpr::Array { element, .. } => self.ty(element, &ast_path(path, &["element"])),
+            TypeExpr::Map { key, value, .. } => {
+                self.ty(key, &ast_path(path, &["key"]));
+                self.ty(value, &ast_path(path, &["value"]));
+            }
+            TypeExpr::Set { key, .. } => self.ty(key, &ast_path(path, &["key"])),
+            TypeExpr::Ref { inner, .. } => self.ty(inner, &ast_path(path, &["inner"])),
             TypeExpr::Union { members, .. } => {
                 for (i, m) in members.iter().enumerate() {
                     self.ty(m, &ast_path(path, &["members", &i.to_string()]));

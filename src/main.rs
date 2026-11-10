@@ -28,6 +28,9 @@ enum Commands {
         /// 実行/差分テスト対象のバックエンド（デフォルト: js）
         #[arg(long, default_value = "js")]
         backend: String,
+        /// prop 評価のシード（codegen 出力に埋め込む。既定: ドキュメント化された定数）
+        #[arg(long)]
+        seed: Option<u64>,
     },
     Fmt {
         files: Vec<PathBuf>,
@@ -49,7 +52,8 @@ fn main() -> ExitCode {
             files,
             out,
             backend,
-        } => ExitCode::from(compile(&files, out.as_deref(), &backend) as u8),
+            seed,
+        } => ExitCode::from(compile(&files, out.as_deref(), &backend, seed) as u8),
         Commands::Fmt { files } => ExitCode::from(fmt_cmd(&files) as u8),
         Commands::Repl { host, seed } => {
             match repl::run_with_options(&host, seed) {
@@ -80,7 +84,7 @@ fn read_diag(file: &str, message: String) -> Diagnostic {
     }
 }
 
-fn compile(files: &[PathBuf], out_dir: Option<&Path>, backend_name: &str) -> i32 {
+fn compile(files: &[PathBuf], out_dir: Option<&Path>, backend_name: &str, seed: Option<u64>) -> i32 {
     let Some(backend) = backends::lookup(backend_name) else {
         let d = read_diag(
             backend_name,
@@ -115,7 +119,7 @@ fn compile(files: &[PathBuf], out_dir: Option<&Path>, backend_name: &str) -> i32
             .and_then(|f| f.parent().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from(".")),
     };
-    match backend.compile(&sources, &out_root) {
+    match backend.compile(&sources, &out_root, seed.unwrap_or(lists::rng::DEFAULT_SEED)) {
         Ok(_artifacts) => {
             println!("[]");
             0

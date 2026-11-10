@@ -30,6 +30,11 @@ pub fn is_generatable(ty: &Type, aliases: &AliasEnv) -> bool {
     match normalize_type(ty, aliases) {
         Type::FnT(..) | Type::Var(_) => false,
         Type::Array(t) => is_generatable(&t, aliases),
+        Type::Map(k, v) => is_generatable(&k, aliases) && is_generatable(&v, aliases),
+        Type::Set(k) => is_generatable(&k, aliases),
+        Type::Builder => true,
+        Type::Bytes => true,
+        Type::Ref(_) => false,
         Type::Union(ms) => ms.iter().all(|m| is_generatable(m, aliases)),
         Type::Obj(fields) => fields.values().all(|t| is_generatable(t, aliases)),
         Type::ResultT(t, e) => is_generatable(&t, aliases) && is_generatable(&e, aliases),
@@ -82,6 +87,10 @@ pub fn gen_value(ty: &Type, aliases: &AliasEnv, rng: &mut Rng, depth: usize) -> 
             }
             Some(Value::Str(Rc::from(s)))
         }
+        Type::Char => {
+            let idx = rng.gen_range(0, (STR_CHARSET.len() - 1) as u64) as usize;
+            Some(Value::Char(STR_CHARSET[idx]))
+        }
         Type::Literal(lit) => Some(Value::Str(lit)),
         Type::Array(t) => {
             let len = if rng.gen_range(0, 2) == 0 { 0 } else { rng.gen_range(0, 6) as usize };
@@ -98,6 +107,52 @@ pub fn gen_value(ty: &Type, aliases: &AliasEnv, rng: &mut Rng, depth: usize) -> 
             }
             Some(Value::Obj(out))
         }
+        Type::Map(k, v) => {
+            let n = rng.gen_range(0, 4) as usize;
+            let mut m = crate::pmap::PersistentMap::new();
+            for _ in 0..n {
+                let key = gen_value(&k, aliases, rng, depth + 1)?;
+                let val = gen_value(&v, aliases, rng, depth + 1)?;
+                let Some(mk) = crate::pmap::MapKey::from_value(&key) else {
+                    return None;
+                };
+                let (next, _) = m.insert(mk, val);
+                m = next;
+            }
+            Some(Value::Map(Rc::new(m)))
+        }
+        Type::Set(k) => {
+            let n = rng.gen_range(0, 4) as usize;
+            let mut m = crate::pmap::PersistentMap::new();
+            for _ in 0..n {
+                let key = gen_value(&k, aliases, rng, depth + 1)?;
+                let Some(mk) = crate::pmap::MapKey::from_value(&key) else {
+                    return None;
+                };
+                let (next, _) = m.insert(mk, Value::Nil);
+                m = next;
+            }
+            Some(Value::Set(Rc::new(m)))
+        }
+        Type::Builder => {
+            let n = rng.gen_range(0, 4) as usize;
+            let mut parts = Vec::with_capacity(n);
+            for _ in 0..n {
+                if let Some(Value::Str(st)) = gen_value(&Type::Str, aliases, rng, depth + 1) {
+                    parts.push(st.to_string());
+                }
+            }
+            Some(Value::Builder(Rc::new(parts)))
+        }
+        Type::Bytes => {
+            let n = rng.gen_range(0, 5) as usize;
+            let mut b = Vec::with_capacity(n);
+            for _ in 0..n {
+                b.push(rng.gen_range(0, 256) as u8);
+            }
+            Some(Value::Bytes(Rc::new(b)))
+        }
+        Type::Ref(_) => None,
         Type::Union(members) => {
             let idx = rng.gen_range(0, (members.len().max(1) - 1) as u64) as usize;
             gen_value(&members[idx], aliases, rng, depth + 1)
@@ -121,8 +176,14 @@ pub fn min_value(ty: &Type, aliases: &AliasEnv) -> Option<Value> {
         Type::Number => Some(Value::Num(0.0)),
         Type::Dec => Some(Value::Dec(0)),
         Type::Str => Some(Value::Str(Rc::from(""))),
+        Type::Char => Some(Value::Char('a')),
         Type::Literal(lit) => Some(Value::Str(lit)),
         Type::Array(_) => Some(Value::Array(Vec::new())),
+        Type::Map(..) => Some(Value::Map(Rc::new(crate::pmap::PersistentMap::new()))),
+        Type::Set(_) => Some(Value::Set(Rc::new(crate::pmap::PersistentMap::new()))),
+        Type::Builder => Some(Value::Builder(Rc::new(Vec::new()))),
+        Type::Bytes => Some(Value::Bytes(Rc::new(Vec::new()))),
+        Type::Ref(_) => None,
         Type::Obj(fields) => {
             let mut out = std::collections::BTreeMap::new();
             for (k, v) in &fields {
@@ -160,8 +221,14 @@ pub fn value_size(v: &Value) -> usize {
             }
         }
         Value::Str(s) => s.chars().count(),
+        Value::Char(_) => 1,
+        Value::Builder(parts) => 1 + parts.iter().map(|p| p.chars().count()).sum::<usize>(),
+        Value::Bytes(b) => 1 + b.len(),
+        Value::Ref(_) => usize::MAX / 2,
         Value::Array(xs) => 1 + xs.iter().map(value_size).sum::<usize>(),
         Value::Obj(m) => 1 + m.values().map(value_size).sum::<usize>(),
+        Value::Map(m) => 1 + m.entries().iter().map(|(k, v)| value_size(&k.to_value()) + value_size(v)).sum::<usize>(),
+        Value::Set(s) => 1 + s.keys().iter().map(|k| value_size(&k.to_value())).sum::<usize>(),
         Value::Ok(x) | Value::Err(x) => 1 + value_size(x),
         Value::Closure(_) | Value::Builtin(_) => usize::MAX / 2,
     }
@@ -397,6 +464,17 @@ pub fn value_to_lit(v: &Value) -> String {
         ),
         Value::Ok(x) => format!("(ok {})", value_to_lit(x)),
         Value::Err(x) => format!("(err {})", value_to_lit(x)),
+        // map/set にはリテラル構文が無いため print_value 形式で印字（REPORT.md に記録）
+        Value::Map(_) | Value::Set(_) => print_value(v),
+        Value::Ref(_) => "<ref>".to_string(),
+        // bytes にはリテラル構文が無いので印字形式で（REPORT.md 記録）
+        Value::Bytes(_) => print_value(v),
+        Value::Builder(parts) => format!(
+            "(array {})",
+            parts.iter().map(|p| serde_json::to_string(p).unwrap_or_else(|_| format!("\"{p}\""))).collect::<Vec<_>>().join(" ")
+        ),
+        // char はリテラル構文 `\<文字>` があるのでそれで印字
+        Value::Char(c) => crate::fmt::print_char_lit(*c),
         Value::Dec(s) => crate::decimal::fmt_dec(*s),
         Value::Closure(_) | Value::Builtin(_) => "<fn>".to_string(),
     }

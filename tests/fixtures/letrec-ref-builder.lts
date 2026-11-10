@@ -1,0 +1,78 @@
+;; letrec-ref-builder.lts — design/interp-capability.md §2.1（letrec C5）/ §1.5（ref C6）/ §3.2（builder C3）の差分テスト fixture。
+
+;; --- letrec（§2.1）: 自己再帰 ---
+(defn fact (n : number) : number
+  (letrec [go (fn (i : number) (acc : number) : number
+                (if (= i 0) acc (go (- i 1) (* acc i))))]
+    (go n 1)))
+(example (fact 10) => 3628800)
+(example (fact 0) => 1)
+
+;; letrec: 親環境を参照するクロージャを返す
+(defn make-adder (x : number) : (fn (y : number) : number)
+  (letrec [f (fn (y : number) : number (+ x y))]
+    f))
+(example (let [add3 (make-adder 3)] (add3 4)) => 7)
+(example (let [add10 (make-adder 10)] (add10 5)) => 15)
+
+;; letrec: body は複数式（最後が値）
+(example (letrec [f (fn (n : number) : number (if (= n 0) 0 (+ 1 (f (- n 1)))))]
+           1
+           (f 5))
+  => 5)
+
+;; letrec: 束縛名は letrec の lam 内で参照可能（自己再帰）。相互再帰 defn は本仕様の対象外（§2.1）
+(defn count-up (n : number) (i : number) : number
+  (letrec [loop (fn (k : number) : number (if (= k n) k (loop (+ k 1))))]
+    (loop i)))
+(example (count-up 5 0) => 5)
+
+;; --- builder（§3.2）: 不変値・償却 O(n) ---
+(example (builder->str (builder-empty)) => "")
+(example (builder->str (builder-push (builder-empty) "a")) => "a")
+(example (builder-join (array "a" "b" "c") "-") => "a-b-c")
+(example (builder-join (array) ",") => "")
+;; 不変性: push は新しい builder を返し、元は不変
+(defn check-imm () : bool
+  (let [b1 (builder-push (builder-empty) "x")]
+    (let [b2 (builder-push b1 "y")]
+      (and (= (builder->str b1) "x") (= (builder->str b2) "xy")))))
+(example (check-imm) => true)
+;; 印字は JS 側の配列表現と一致する形
+(example (str (builder-push (builder-empty) "a")) => "[a]")
+
+;; 10^4 要素の畳み込み（償却 O(n)。interp は共有時のみ複製、JS は配列コピー）
+(defn build (i : number) (b : builder) : builder
+  (if (< i 10000) (build (+ i 1) (builder-push b (str i))) b))
+;; len(str i) の和: 10*1 + 90*2 + 900*3 + 9000*4 = 38890
+(example (len (builder->str (build 0 (builder-empty)))) => 38890)
+
+;; --- ref（§1.5）: 組み込みエフェクト。defn! からのみ ---
+(type Host (obj))
+
+(defn! demo (host : Host) : (Result number nil)
+  (do [r (ref! 0)]
+    (do [_ (ref-set! r 41)]
+      (do [_ (ref-set! r (+ (ref-get! r) 1))]
+        (ok (ref-get! r))))))
+(example (demo (obj)) => (ok 42))
+
+;; ref の等価は参照等価（§8.3 の関数と同じ）
+(defn! self-eq (host : Host) : (Result bool nil)
+  (do [a (ref! 1)]
+    (ok (= a a))))
+(example (self-eq (obj)) => (ok true))
+
+(defn! diff-ref (host : Host) : (Result bool nil)
+  (do [a (ref! 1)]
+    (do [b (ref! 1)]
+      (ok (= a b)))))
+(example (diff-ref (obj)) => (ok false))
+
+;; 共有セル: 片方の ref-set! がもう片方から見える
+(defn! share (host : Host) : (Result number nil)
+  (do [a (ref! 10)]
+    (let [b a]
+      (do [_ (ref-set! b 99)]
+        (ok (ref-get! a))))))
+(example (share (obj)) => (ok 99))

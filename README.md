@@ -242,6 +242,7 @@ analysis/       v0.3-pre-audit.md（v0.3 事前監査）
 - 依存の追加は最小限に（GUIDE.md §3）。現在の依存: `serde` / `serde_json`（診断JSON・REPL）、`thiserror`、`clap` 4（CLI）、`sourcemap` 9（source map v3 生成）
 - 新しいバックエンド（例: WASM）の追加は `Backend` trait（`src/backends.rs`）の3メソッドを実装して `registry()` に登録するだけで、差分テストに自動で参加します。手順は [docs/backends.md](docs/backends.md) を参照
 - ドキュメント一覧: [SPEC.md](SPEC.md)（言語仕様 v0.2 の全文）、[GUIDE.md](GUIDE.md)（実装開発ガイド）、[docs/README.md](docs/README.md)（詳細・実測値・既知の相違）、[docs/backends.md](docs/backends.md)（バックエンド実装ガイド）、[audit/backend-portability.md](audit/backend-portability.md)（可搬性監査レポート）、[analysis/v0.3-pre-audit.md](analysis/v0.3-pre-audit.md)（v0.3 事前監査）
+- 差分仕様（設計ドラフト・SPEC 未反映）: [design/interp-capability.md](design/interp-capability.md)（interp-capability SPEC v0.1）
 
 ## 実装
 

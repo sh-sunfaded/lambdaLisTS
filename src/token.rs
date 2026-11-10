@@ -32,6 +32,7 @@ pub enum TokenKind {
     DottedSymbol,
     Nil,
     Bool,
+    Char,
     Error,
 }
 
@@ -78,6 +79,7 @@ pub enum TokenValue {
     Dec(Rc<str>),
     Str(String),
     Bool(bool),
+    Char(char),
     Keyword(Rc<str>),
     Symbol { name: Rc<str>, effect: bool },
     Dotted(Vec<Rc<str>>),

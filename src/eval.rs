@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -6,7 +7,58 @@ use crate::ir::{Core, Pat, PatKind};
 use crate::lexer::tokenize;
 use crate::parser::parse_program;
 use crate::resolver::resolve_import_path;
+use crate::pmap::{MapKey, PersistentMap};
 use crate::value::{print_value, structural_equal, Builtin, BuiltinKind, Closure, Env, Value};
+
+fn map_v(v: &Value) -> Result<Rc<PersistentMap>, EvalError> {
+    match v {
+        Value::Map(m) => Ok(m.clone()),
+        _ => Err(EvalError::Runtime("map が必要です".to_string())),
+    }
+}
+
+fn set_v(v: &Value) -> Result<Rc<PersistentMap>, EvalError> {
+    match v {
+        Value::Set(s) => Ok(s.clone()),
+        _ => Err(EvalError::Runtime("set が必要です".to_string())),
+    }
+}
+
+fn map_key(v: &Value) -> Result<MapKey, EvalError> {
+    MapKey::from_value(v).ok_or_else(|| {
+        EvalError::Runtime("map/set のキーは string か number です（design/interp-capability.md §1.1）".to_string())
+    })
+}
+
+fn not_found_value() -> Value {
+    err_tag_value("not-found")
+}
+
+fn err_tag_value(tag: &str) -> Value {
+    Value::Obj(BTreeMap::from([(
+        Rc::from("tag"),
+        Value::Str(Rc::from(tag)),
+    )]))
+}
+
+/// 位置ベース API の開始位置クランプ（slice_bounds の start と同じ規則: NaN→0、負は len+x、len 超過は len）
+fn clamp_start(len: usize, i: f64) -> usize {
+    let len_f = len as f64;
+    if i.is_nan() {
+        0
+    } else if i < 0.0 {
+        (len_f + i).max(0.0) as usize
+    } else {
+        (i.min(len_f)) as usize
+    }
+}
+
+fn char_v(v: &Value) -> Result<char, EvalError> {
+    match v {
+        Value::Char(c) => Ok(*c),
+        _ => Err(EvalError::Runtime("char が必要です".to_string())),
+    }
+}
 
 pub const MAX_CALL_DEPTH: usize = 10000;
 
@@ -22,11 +74,35 @@ pub enum EvalError {
 pub struct Interp {
     pub depth: usize,
     pub calls: BTreeMap<String, usize>,
+    /// design §4: モック host の決定的クロック（now!/elapsed!）。固定列 1700000000000 + 呼び出し回数*1000。
+    pub clock_calls: u64,
+    pub clock_base: Option<f64>,
+    /// trace! の呼び出し記録（repl --host mock ではモック host のログと共有する）
+    pub host_log: Rc<RefCell<Vec<crate::host::HostCall>>>,
+    /// design §4.1: read-file! が読むモックの仮想ファイル（パス → バイト列）
+    pub virtual_files: BTreeMap<String, Vec<u8>>,
 }
+
+/// モック now の固定列の基点（ミリ秒）
+pub const MOCK_NOW_BASE: f64 = 1_700_000_000_000.0;
 
 impl Interp {
     pub fn new() -> Self {
         Interp::default()
+    }
+
+    pub fn set_host_log(&mut self, log: Rc<RefCell<Vec<crate::host::HostCall>>>) {
+        self.host_log = log;
+    }
+
+    /// 決定的な now 値（呼び出しごとに +1000ms）。初回値を base として記録する。
+    fn mock_now(&mut self) -> f64 {
+        let v = MOCK_NOW_BASE + self.clock_calls as f64 * 1000.0;
+        self.clock_calls += 1;
+        if self.clock_base.is_none() {
+            self.clock_base = Some(v);
+        }
+        v
     }
 
     pub fn calls(&self) -> &BTreeMap<String, usize> {
@@ -333,6 +409,225 @@ impl Interp {
                 }
                 Ok(ok_v(Value::Array(out)))
             }
+            BuiltinKind::MapEmpty => Ok(Value::Map(Rc::new(PersistentMap::new()))),
+            BuiltinKind::SetEmpty => Ok(Value::Set(Rc::new(PersistentMap::new()))),
+            BuiltinKind::MapGet => {
+                let m = map_v(&args[0])?;
+                let key = map_key(&args[1])?;
+                match m.get(&key) {
+                    Some(v) => Ok(ok_v(v.clone())),
+                    None => Ok(err_v(not_found_value())),
+                }
+            }
+            BuiltinKind::MapSet => {
+                let m = map_v(&args[0])?;
+                let key = map_key(&args[1])?;
+                let (next, _) = m.insert(key, args[2].clone());
+                Ok(Value::Map(Rc::new(next)))
+            }
+            BuiltinKind::MapDel => {
+                let m = map_v(&args[0])?;
+                let key = map_key(&args[1])?;
+                let (next, _) = m.remove(&key);
+                Ok(Value::Map(Rc::new(next)))
+            }
+            BuiltinKind::MapKeys => {
+                let m = map_v(&args[0])?;
+                Ok(Value::Array(m.keys().iter().map(|k| k.to_value()).collect()))
+            }
+            BuiltinKind::MapHas => {
+                let m = map_v(&args[0])?;
+                let key = map_key(&args[1])?;
+                Ok(Value::Bool(m.has(&key)))
+            }
+            BuiltinKind::MapSize => Ok(Value::Num(map_v(&args[0])?.len() as f64)),
+            BuiltinKind::SetAdd => {
+                let s = set_v(&args[0])?;
+                let key = map_key(&args[1])?;
+                let (next, _) = s.insert(key, Value::Nil);
+                Ok(Value::Set(Rc::new(next)))
+            }
+            BuiltinKind::SetHas => {
+                let s = set_v(&args[0])?;
+                let key = map_key(&args[1])?;
+                Ok(Value::Bool(s.has(&key)))
+            }
+            BuiltinKind::SetToArray => {
+                let s = set_v(&args[0])?;
+                Ok(Value::Array(s.keys().iter().map(|k| k.to_value()).collect()))
+            }
+            BuiltinKind::ObjToMap => match &args[0] {
+                Value::Obj(fields) => {
+                    // BTreeMap のキー順（UTF-8 バイト順）= 決定的な挿入順
+                    let mut m = PersistentMap::new();
+                    for (k, v) in fields {
+                        let (next, _) = m.insert(MapKey::Str(k.clone()), v.clone());
+                        m = next;
+                    }
+                    Ok(Value::Map(Rc::new(m)))
+                }
+                _ => Err(EvalError::Runtime("obj->map は obj が必要です".to_string())),
+            },
+            BuiltinKind::CharAt => {
+                let chars: Vec<char> = str_v(&args[0])?.chars().collect();
+                let i = num(&args[1])?;
+                // 小数添字は nth と同じく切り捨て（§11.6）。NaN・範囲外は out-of-range。
+                let k = if i.is_nan() { usize::MAX } else { i.trunc() as usize };
+                if i.is_nan() || i < 0.0 || k >= chars.len() {
+                    Ok(err_v(err_tag_value("out-of-range")))
+                } else {
+                    Ok(ok_v(Value::Char(chars[k])))
+                }
+            }
+            BuiltinKind::CharCode => Ok(Value::Num(char_v(&args[0])? as u32 as f64)),
+            BuiltinKind::CodeToChar => {
+                let n = num(&args[0])?;
+                let valid = n.is_finite()
+                    && n == n.trunc()
+                    && n >= 0.0
+                    && n <= 0x10FFFF as f64
+                    && !(0xD800..=0xDFFF).contains(&(n as u32));
+                match valid.then(|| char::from_u32(n as u32)).flatten() {
+                    Some(c) => Ok(ok_v(Value::Char(c))),
+                    None => Ok(err_v(err_tag_value("invalid-code"))),
+                }
+            }
+            BuiltinKind::StrTakeWhile => {
+                let chars: Vec<char> = str_v(&args[0])?.chars().collect();
+                let start = clamp_start(chars.len(), num(&args[1])?);
+                let f = args[2].clone();
+                let mut acc = String::new();
+                let mut pos = start;
+                while pos < chars.len() && bool_v(&self.apply(f.clone(), vec![Value::Char(chars[pos])])?)? {
+                    acc.push(chars[pos]);
+                    pos += 1;
+                }
+                Ok(Value::Obj(BTreeMap::from([
+                    (Rc::from("acc"), Value::Str(Rc::from(acc.as_str()))),
+                    (Rc::from("pos"), Value::Num(pos as f64)),
+                ])))
+            }
+            BuiltinKind::StrSkipWhile => {
+                let chars: Vec<char> = str_v(&args[0])?.chars().collect();
+                let start = clamp_start(chars.len(), num(&args[1])?);
+                let f = args[2].clone();
+                let mut pos = start;
+                while pos < chars.len() && bool_v(&self.apply(f.clone(), vec![Value::Char(chars[pos])])?)? {
+                    pos += 1;
+                }
+                Ok(Value::Num(pos as f64))
+            }
+            BuiltinKind::StrSplitAt => {
+                let chars: Vec<char> = str_v(&args[0])?.chars().collect();
+                let i = num(&args[1])?;
+                let k = if i.is_nan() { None } else { Some(i.trunc() as usize) };
+                match k {
+                    Some(k) if !i.is_nan() && i >= 0.0 && k <= chars.len() => {
+                        let left: String = chars[..k].iter().collect();
+                        let right: String = chars[k..].iter().collect();
+                        Ok(ok_v(Value::Obj(BTreeMap::from([
+                            (Rc::from("left"), Value::Str(Rc::from(left.as_str()))),
+                            (Rc::from("right"), Value::Str(Rc::from(right.as_str()))),
+                        ]))))
+                    }
+                    _ => Ok(err_v(err_tag_value("out-of-range"))),
+                }
+            }
+            BuiltinKind::StrContains => Ok(Value::Bool(str_v(&args[0])?.contains(&*str_v(&args[1])?))),
+            BuiltinKind::CharLe => Ok(Value::Bool(char_v(&args[0])? <= char_v(&args[1])?)),
+            BuiltinKind::CharEq => Ok(Value::Bool(char_v(&args[0])? == char_v(&args[1])?)),
+            BuiltinKind::CharAlphabetic => Ok(Value::Bool(char_v(&args[0])?.is_alphabetic())),
+            BuiltinKind::CharNumeric => Ok(Value::Bool(char_v(&args[0])?.is_numeric())),
+            BuiltinKind::CharWhitespace => Ok(Value::Bool(char_v(&args[0])?.is_whitespace())),
+            BuiltinKind::BuilderEmpty => Ok(Value::Builder(Rc::new(Vec::new()))),
+            BuiltinKind::BuilderPush => {
+                let b = match &args[0] {
+                    Value::Builder(b) => Rc::clone(b),
+                    _ => return Err(EvalError::Runtime("builder が必要です".to_string())),
+                };
+                let s = str_v(&args[1])?;
+                // 共有されていなければ in-place（線形利用で償却 O(1)）。共有時のみ複製（永続性維持）。
+                let mut nb = b;
+                Rc::make_mut(&mut nb).push(s.to_string());
+                Ok(Value::Builder(nb))
+            }
+            BuiltinKind::BuilderToStr => {
+                let parts = match &args[0] {
+                    Value::Builder(b) => b.clone(),
+                    _ => return Err(EvalError::Runtime("builder が必要です".to_string())),
+                };
+                Ok(Value::Str(Rc::from(parts.join("").as_str())))
+            }
+            BuiltinKind::BuilderJoin => {
+                let arr = arr_v(&args[0])?;
+                let sep = str_v(&args[1])?;
+                let mut out = String::new();
+                for (i, x) in arr.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(&sep);
+                    }
+                    out.push_str(&str_v(x)?);
+                }
+                Ok(Value::Str(Rc::from(out.as_str())))
+            }
+            BuiltinKind::BytesGet => {
+                let b = match &args[0] {
+                    Value::Bytes(b) => b.clone(),
+                    _ => return Err(EvalError::Runtime("bytes が必要です".to_string())),
+                };
+                let i = num(&args[1])?;
+                // nth と同じく小数添字は切り捨て、範囲外は nil（Option）
+                let k = if i.is_nan() { usize::MAX } else { i.trunc() as usize };
+                if !i.is_nan() && i >= 0.0 && k < b.len() {
+                    Ok(Value::Num(b[k] as f64))
+                } else {
+                    Ok(Value::Nil)
+                }
+            }
+            BuiltinKind::BytesLen => match &args[0] {
+                Value::Bytes(b) => Ok(Value::Num(b.len() as f64)),
+                _ => Err(EvalError::Runtime("bytes が必要です".to_string())),
+            },
+            BuiltinKind::BytesSlice => {
+                let b = match &args[0] {
+                    Value::Bytes(b) => b.clone(),
+                    _ => return Err(EvalError::Runtime("bytes が必要です".to_string())),
+                };
+                let (a, z) = slice_bounds(b.len(), num(&args[1])?, num(&args[2])?);
+                Ok(Value::Bytes(Rc::new(b[a..z].to_vec())))
+            }
+            BuiltinKind::StrToBytes => {
+                let s = str_v(&args[0])?;
+                Ok(Value::Bytes(Rc::new(s.as_bytes().to_vec())))
+            }
+            BuiltinKind::BytesToStr => match &args[0] {
+                Value::Bytes(b) => match std::str::from_utf8(b) {
+                    Ok(s) => Ok(ok_v(Value::Str(Rc::from(s)))),
+                    Err(_) => Ok(err_v(err_tag_value("invalid-utf8"))),
+                },
+                _ => Err(EvalError::Runtime("bytes が必要です".to_string())),
+            },
+            BuiltinKind::StrToCodepoints => {
+                let s = str_v(&args[0])?;
+                Ok(Value::Array(s.chars().map(|c| Value::Num(c as u32 as f64)).collect()))
+            }
+            BuiltinKind::CodepointsToStr => {
+                let arr = arr_v(&args[0])?;
+                let mut s = String::new();
+                for x in &arr {
+                    let n = num(x)?;
+                    let valid = n.is_finite()
+                        && n == n.trunc()
+                        && n >= 0.0
+                        && n <= 0x10FFFF as f64
+                        && !(0xD800..=0xDFFF).contains(&(n as u32));
+                    match valid.then(|| char::from_u32(n as u32)).flatten() {
+                        Some(c) => s.push(c),
+                        None => return Ok(err_v(err_tag_value("invalid-code"))),
+                    }
+                }
+                Ok(ok_v(Value::Str(Rc::from(s.as_str()))))
+            }
             BuiltinKind::HostMock {
                 effect,
                 default,
@@ -444,6 +739,35 @@ fn eval_loop(interp: &mut Interp, e: &Core, env: &Rc<Env>) -> Result<Value, Eval
                 env = Env::child_of(&env, BTreeMap::from([(name, v)]));
                 *body
             }
+            Core::Letrec {
+                name,
+                lam,
+                body,
+                span,
+            } => {
+                // design §2.1: 束縛対象は Lam のみ（check で検査済み）。自己参照環境を作る。
+                let Core::Lam {
+                    params,
+                    body: lam_body,
+                    ..
+                } = lam.as_ref()
+                else {
+                    return Err(EvalError::Runtime(format!(
+                        "letrec の束縛対象は fn のみです（span {:?}）",
+                        span
+                    )));
+                };
+                let child = Env::child_of(&env, BTreeMap::new());
+                let clo = Value::Closure(Rc::new(Closure {
+                    params: params.clone(),
+                    body: Rc::new((**lam_body).clone()),
+                    env: child.clone(),
+                    name: Some(name.clone()),
+                }));
+                child.define(name.clone(), clo);
+                env = child;
+                return eval_core(interp, &body, &env);
+            }
             Core::If {
                 cond,
                 then,
@@ -522,6 +846,53 @@ fn eval_loop(interp: &mut Interp, e: &Core, env: &Rc<Env>) -> Result<Value, Eval
                 args,
                 ..
             } => {
+                // design §1.5/§4: 組み込みエフェクトは host 不要で直接評価する
+                if crate::effects::is_builtin_effect(effect.as_ref()) {
+                    let mut argv = Vec::with_capacity(args.len());
+                    for a in &args {
+                        argv.push(eval_core(interp, a, &env)?);
+                    }
+                    return match effect.as_ref() {
+                        // §4: now!/elapsed! はモックでは固定列で決定的、trace! は呼び出し記録へ蓄積
+                        "now" => Ok(Value::Num(interp.mock_now())),
+                        "elapsed" => {
+                            let n = interp.mock_now();
+                            let base = interp.clock_base.unwrap_or(n);
+                            Ok(Value::Num(n - base))
+                        }
+                        "trace" => {
+                            interp.host_log.borrow_mut().push(crate::host::HostCall {
+                                effect: effect.clone(),
+                                args: argv,
+                            });
+                            Ok(Value::Nil)
+                        }
+                        // §4.1: read-file! はモックの仮想ファイルから読む。無ければ io-error。
+                        "read-file" => {
+                            let path = match &argv[0] {
+                                Value::Str(s) => s.to_string(),
+                                _ => return Err(EvalError::Runtime("read-file! は string が必要です".to_string())),
+                            };
+                            match interp.virtual_files.get(&path) {
+                                Some(data) => Ok(Value::Ok(Box::new(Value::Bytes(Rc::new(data.clone()))))),
+                                None => Ok(Value::Err(Box::new(err_tag_value("io-error")))),
+                            }
+                        }
+                        "ref" => Ok(Value::Ref(Rc::new(RefCell::new(argv[0].clone())))),
+                        "ref-get" => match &argv[0] {
+                            Value::Ref(r) => Ok(r.borrow().clone()),
+                            _ => Err(EvalError::Runtime("ref-get! は ref が必要です".to_string())),
+                        },
+                        "ref-set" => match &argv[0] {
+                            Value::Ref(r) => {
+                                *r.borrow_mut() = argv[1].clone();
+                                Ok(Value::Nil)
+                            }
+                            _ => Err(EvalError::Runtime("ref-set! は ref が必要です".to_string())),
+                        },
+                        _ => unreachable!(),
+                    };
+                }
                 // P1 (§12.4/§12.6): EffectCall は host オブジェクトのハンドラを呼ぶ。
                 // host は囲んでいる defn! の第1引数として束縛されている。
                 let hv = env.lookup(host.as_ref()).ok_or_else(|| {
@@ -650,6 +1021,41 @@ pub fn stdlib_env() -> Rc<Env> {
     def("traverse", BuiltinKind::Traverse);
     def("to-dec", BuiltinKind::ToDec);
     def("to-num", BuiltinKind::ToNum);
+    def("map-empty", BuiltinKind::MapEmpty);
+    def("map-get", BuiltinKind::MapGet);
+    def("map-set", BuiltinKind::MapSet);
+    def("map-del", BuiltinKind::MapDel);
+    def("map-keys", BuiltinKind::MapKeys);
+    def("map-has?", BuiltinKind::MapHas);
+    def("map-size", BuiltinKind::MapSize);
+    def("set-empty", BuiltinKind::SetEmpty);
+    def("set-add", BuiltinKind::SetAdd);
+    def("set-has?", BuiltinKind::SetHas);
+    def("set->array", BuiltinKind::SetToArray);
+    def("obj->map", BuiltinKind::ObjToMap);
+    def("char-at", BuiltinKind::CharAt);
+    def("char-code", BuiltinKind::CharCode);
+    def("code->char", BuiltinKind::CodeToChar);
+    def("str-take-while", BuiltinKind::StrTakeWhile);
+    def("str-skip-while", BuiltinKind::StrSkipWhile);
+    def("str-split-at", BuiltinKind::StrSplitAt);
+    def("str-contains?", BuiltinKind::StrContains);
+    def("char<=?", BuiltinKind::CharLe);
+    def("char=?", BuiltinKind::CharEq);
+    def("char-alphabetic?", BuiltinKind::CharAlphabetic);
+    def("char-numeric?", BuiltinKind::CharNumeric);
+    def("char-whitespace?", BuiltinKind::CharWhitespace);
+    def("builder-empty", BuiltinKind::BuilderEmpty);
+    def("builder-push", BuiltinKind::BuilderPush);
+    def("builder->str", BuiltinKind::BuilderToStr);
+    def("builder-join", BuiltinKind::BuilderJoin);
+    def("bytes-get", BuiltinKind::BytesGet);
+    def("bytes-len", BuiltinKind::BytesLen);
+    def("bytes-slice", BuiltinKind::BytesSlice);
+    def("str->bytes", BuiltinKind::StrToBytes);
+    def("bytes->str", BuiltinKind::BytesToStr);
+    def("str->codepoints", BuiltinKind::StrToCodepoints);
+    def("codepoints->str", BuiltinKind::CodepointsToStr);
     env
 }
 

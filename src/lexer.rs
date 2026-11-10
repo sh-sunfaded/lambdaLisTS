@@ -373,10 +373,103 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// char リテラル `\<文字>`（design/interp-capability.md §1.2）。
+    /// エスケープ規則は str リテラルと共通（\" \\ \n \t \r \uXXXX）。
+    /// `\` の次がエスケープならその文字、さもなくば次の1文字（改行・EOF は不可）。
+    fn lex_char(&mut self) {
+        let (start, line, col) = self.mark();
+        self.bump(); // '\'
+        let c = match self.peek() {
+            None | Some('\n') => {
+                let end = self.pos;
+                self.emit_error(start, line, col, end, "char リテラルが閉じていません".to_string());
+                return;
+            }
+            Some(c) => c,
+        };
+        // str リテラルと同じエスケープ規則を1文字に適用する（§1.2「共通化」）。
+        let value = match c {
+            'u' => {
+                let hex: String = self.src[self.pos + 1..].chars().take(4).collect();
+                if hex.len() == 4 && hex.chars().all(is_hex) {
+                    self.bump();
+                    for _ in 0..4 {
+                        self.bump();
+                    }
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(ch) => ch,
+                        None => {
+                            let end = self.pos;
+                            self.emit_error(
+                                start,
+                                line,
+                                col,
+                                end,
+                                format!("無効なエスケープシーケンスです: \\u{hex}（サロゲートは存在しません）"),
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    self.bump();
+                    let end = self.pos;
+                    self.emit_error(start, line, col, end, "\\u エスケープには4桁の16進数が必要です".to_string());
+                    return;
+                }
+            }
+            '"' | '\\' | 'n' | 't' | 'r' => {
+                self.bump();
+                match c {
+                    '"' => '"',
+                    '\\' => '\\',
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    _ => unreachable!(),
+                }
+            }
+            other => {
+                self.bump();
+                other
+            }
+        };
+        let end = self.pos;
+        self.emit(
+            TokenKind::Char,
+            start,
+            line,
+            col,
+            end,
+            Some(TokenValue::Char(value)),
+        );
+    }
+
     fn scan_name(&mut self) -> (usize, usize) {
         let start = self.pos;
-        while self.peek().is_some_and(is_symbol_char) {
-            self.bump();
+        // 名前中で許す演算子由来の接尾辞（design/interp-capability.md §3.1 の char<=? / char=? 等）。
+        // 単独の '<' '>' '=' は従来通り演算子（Punct）として扱う。
+        const OP_SUFFIXES: &[&str] = &["<=?", ">=?", "=?", "<?", ">?"];
+        while let Some(c) = self.peek() {
+            if is_symbol_char(c) {
+                self.bump();
+            } else if c == '>'
+                && self.src[..self.pos].ends_with('-')
+                && self.peek_second().is_some_and(is_symbol_char)
+            {
+                // 名前中の "->" はシンボルの一部（design §1.1 の obj->map / set->array 等）。
+                // 単独の '->' は list 先頭のパイプなので is_symbol_start('-') == false のため
+                // 従来通り Punct::Arrow になる。
+                self.bump();
+            } else if let Some(s) = OP_SUFFIXES
+                .iter()
+                .find(|s| self.src[self.pos..].starts_with(**s))
+            {
+                for _ in 0..s.chars().count() {
+                    self.bump();
+                }
+            } else {
+                break;
+            }
         }
         (start, self.pos)
     }
@@ -489,6 +582,8 @@ impl<'a> Lexer<'a> {
                 self.lex_one(TokenKind::CloseBrace);
             } else if c == '"' {
                 self.lex_string();
+            } else if c == '\\' {
+                self.lex_char();
             } else if is_digit(c) || (c == '-' && self.peek_second().is_some_and(is_digit)) {
                 self.lex_number();
             } else if c == ':' && self.peek_second().is_some_and(is_symbol_start) {
@@ -894,6 +989,47 @@ mod tests {
         );
         assert_eq!(&*r.tokens[0].text, "->");
         assert_eq!(&*r.tokens[1].text, "=>");
+    }
+
+    #[test]
+    fn char_literals() {
+        // design/interp-capability.md §1.2: \<文字>。エスケープは str と共通。
+        let r = lex("\\a \\n \\u0041 \\😀");
+        let vals: Vec<Option<TokenValue>> = r.tokens.iter().map(|t| t.value.clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                Some(TokenValue::Char('a')),
+                Some(TokenValue::Char('\n')),
+                Some(TokenValue::Char('A')),
+                Some(TokenValue::Char('😀')),
+            ]
+        );
+        assert!(r.diagnostics.is_empty());
+        // サロゲートは char になれない
+        let r = lex("\\uD800");
+        assert!(!r.diagnostics.is_empty());
+        // 演算子接尾辞を含む名前（§3.1: char<=? / char=?）
+        let r = lex("(char<=? a b) (char=? a b) (<= a b) (= a b)");
+        let texts: Vec<&str> = r.tokens.iter().map(|t| &*t.text).collect();
+        assert_eq!(
+            texts,
+            ["(", "char<=?", "a", "b", ")", "(", "char=?", "a", "b", ")", "(", "<=", "a", "b", ")", "(", "=", "a", "b", ")"]
+        );
+        assert!(r.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn arrow_inside_symbol_is_part_of_name() {
+        // design/interp-capability.md §1.1: obj->map / set->array は単一シンボル
+        let r = lex("(obj->map o) (set->array s) (-> a b)");
+        let texts: Vec<&str> = r.tokens.iter().map(|t| &*t.text).collect();
+        assert_eq!(
+            texts,
+            ["(", "obj->map", "o", ")", "(", "set->array", "s", ")", "(", "->", "a", "b", ")"]
+        );
+        assert!(r.diagnostics.is_empty());
+        assert_eq!(r.tokens[9].value, Some(TokenValue::Punct(Punct::Arrow)));
     }
 
     #[test]
