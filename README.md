@@ -2,6 +2,13 @@
 
 λ LisTS（SPEC.md v0.2, P0）のプロトタイプ実装です（Rust/cargo 製）。レキサ・パーサ・脱糖・双方向型検査・網羅性検査・エフェクト/モジュール検査・インタプリタ・JS バックエンド・CLI/REPL/フォーマッタを含みます。
 
+## 概要
+
+- レキサ・パーサ・脱糖・双方向型検査・網羅性検査・エフェクト/モジュール検査・インタプリタ・JSバックエンドを含むプロトタイプ実装
+- 成果物は単一バイナリ`lists`(生成JSの実行以外に外部ランタイム不要)
+- CLIは`compile` / `fmt` / `repl`の3サブコマンド
+- 全183件のテスト(単体146 + 統合37)とゴールデン・差分テストを同梱
+
 ## 動作環境
 
 - Rust toolchain（edition 2021、MSRV 1.75+）。**ビルドに Node.js / npm は不要**です
@@ -138,7 +145,7 @@ op の意味:
 - `quit`: 終了します
 - 未知の op や不正な JSON 行も `ok: false` + `errors` で応答します
 
-## λ LisTS >書き方（抜粋）
+## 書き方（抜粋）
 
 ```lisp
 (type Money (obj (amount : number) (currency : string)))
@@ -169,13 +176,13 @@ op の意味:
 | 配列 | `array` `nth` `count` `slice` `push` `concat` `map` `filter` `fold-left` `find` `any?` `all?` |
 | Result | `ok` `err` `bind` `map-result` `traverse` |
 
-## P0 >制限
+## 制限
 
 - `defn!`（エフェクト関数）は P1 で完全実装済みです。host を第1引数に取り、JS では `async function` + `await host.<effect>(args)` に生成され（§12.4/§12.6）、インタープリタでも host 経由で実行されます。純粋 `defn` からの effect 呼び出し・`defn!` 呼び出しは `effect-violation`（§7.2/§7.4）
 - `prop` >評価（反例生成・縮小）は P1。構文と型検査のみ行います
 - 末尾呼び出し（末尾位置の `App`）は **proper tail call** で、インタプリタ・JS の両方で定数スタックで実行されます（M12、§8.5 MUST。JS では 10^8 回の末尾再帰も成功）。非末尾再帰の深さ上限は実装依存のままです（実測値は docs/README.md に記載。インタプリタは `MAX_CALL_DEPTH = 10000`、`src/eval.rs` で超過時にパニックせず `internal-error` を返します）
 
-##構成
+## 構成
 
 ```
 src/
@@ -252,3 +259,7 @@ analysis/       v0.3-pre-audit.md（v0.3 事前監査）
 - 生成した JS の実行には Node.js ≥ 20 が必要です（コンパイラ自体は Node に依存しません）
 - `src/backend/runtime.js` は生成JSが `import` するランタイムで、`src/runtime.rs` から `include_str!` で埋め込まれるため削除しないでください
 - Rust インタプリタの非末尾再帰の深さ上限は `src/eval.rs` > `MAX_CALL_DEPTH = 10000` です（SPEC §8.5）。上限超過時はパニックせず `internal-error` を返します。末尾呼び出しは proper tail call として定数スタックで実行されます
+
+## ライセンス
+
+Apache-2.0([LICENSE](LICENSE)を参照)。
